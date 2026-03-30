@@ -1,0 +1,14 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    ports:
+      - "7476:7474"
+      - "7689:7687"
+    environment:
+      NEO4J_AUTH: neo4j/nous-dev
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  neo4j_data:

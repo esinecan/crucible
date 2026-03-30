@@ -1,0 +1,57 @@
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass
+class Corpus:
+    id: str
+    name: str
+    description: str = ""
+    source_path: str = ""
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Document:
+    id: str
+    corpus_id: str
+    path: str
+    title: str
+    source_type: str  # markdown, json, text, etc.
+    content_hash: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+    ingested_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Chunk:
+    id: str
+    document_id: str
+    text: str
+    position: int
+    heading: str = ""
+    embedding: list[float] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Insight:
+    id: str
+    corpus_id: str
+    text: str
+    strategy: str
+    score: float = 0.0
+    novelty: float = 0.0
+    relevance: float = 0.0
+    layer: int = 1  # 1 = derived from chunks, 2 = derived from insights
+    embedding: list[float] = field(default_factory=list)
+    source_chunk_ids: list[str] = field(default_factory=list)
+    source_insight_ids: list[str] = field(default_factory=list)
+    context: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)

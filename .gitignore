@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+insight_rewards.jsonl
+.crucible_progress.json
+.nous_progress.json
