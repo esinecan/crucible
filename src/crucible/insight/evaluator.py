@@ -10,45 +10,39 @@ import httpx
 
 from ..config import Config
 
-# ── Domain Context ──────────────────────────────────────────
+# ── Prompt Builders (domain injected at runtime) ────────────
 
-DOMAIN_PREAMBLE = (
-    "Domain: freight logistics platform (microservices, event-driven). "
-    "Key entities: shipments, quotes, rates, tariffs, legal entities, pricing engine. "
-    "Key services: rates-management-core, pricing, booking-v2-core, shipments. "
-    "V1/V2 migration ongoing. Team uses NestJS/TypeScript, MongoDB, PubSub, Neo4j.\n\n"
-)
+def _advocate_system(domain: str) -> str:
+    return domain + (
+        "You are an insight advocate. Argue why this candidate insight from "
+        "a knowledge base is a genuinely valuable discovery.\n\n"
+        "Focus on:\n"
+        "- What non-obvious connection or pattern does this reveal?\n"
+        "- What would someone learn that they couldn't see from individual sources?\n"
+        "- Does this challenge assumptions or reveal hidden connections?\n\n"
+        "Be specific. Cite evidence from the text. 2-3 sentences max."
+    )
 
-# ── Prompts ─────────────────────────────────────────────────
+def _skeptic_system(domain: str) -> str:
+    return domain + (
+        "You are an insight skeptic. Argue why this candidate insight is NOT "
+        "interesting or valuable.\n\n"
+        "Focus on:\n"
+        "- Is this just surface-level keyword or topic overlap?\n"
+        "- Would any informed reader already know this?\n"
+        "- Is the connection trivial or obvious from the shared context?\n\n"
+        "Be specific. 2-3 sentences max."
+    )
 
-ADVOCATE_SYSTEM = DOMAIN_PREAMBLE + (
-    "You are an insight advocate. Argue why this candidate insight from the "
-    "team's knowledge base is a genuinely valuable discovery.\n\n"
-    "Focus on:\n"
-    "- What non-obvious connection or pattern does this reveal?\n"
-    "- What would someone learn that they couldn't see from individual sources?\n"
-    "- Does this challenge assumptions or reveal hidden dependency chains?\n\n"
-    "Be specific. Cite evidence from the text. 2-3 sentences max."
-)
-
-SKEPTIC_SYSTEM = DOMAIN_PREAMBLE + (
-    "You are an insight skeptic. Argue why this candidate insight is NOT "
-    "interesting or valuable.\n\n"
-    "Focus on:\n"
-    "- Is this just surface-level keyword or topic overlap?\n"
-    "- Would any engineer on this team already know this?\n"
-    "- Is the connection trivial (same repo, same team, same sprint, obvious dependency)?\n\n"
-    "Be specific. 2-3 sentences max."
-)
-
-REFEREE_SYSTEM = DOMAIN_PREAMBLE + (
-    "You are a referee. An advocate argued an insight is valuable, "
-    "a skeptic argued it's not. Score the insight on three dimensions:\n\n"
-    "- novelty (0.0-1.0): How surprising to an engineer on this team?\n"
-    "- relevance (0.0-1.0): How useful for debugging, planning, or onboarding?\n"
-    "- actionability (0.0-1.0): Does it suggest a concrete investigation, fix, or refactor?\n\n"
-    "Return ONLY valid JSON: {\"novelty\": X, \"relevance\": Y, \"actionability\": Z}"
-)
+def _referee_system(domain: str) -> str:
+    return domain + (
+        "You are a referee. An advocate argued an insight is valuable, "
+        "a skeptic argued it's not. Score the insight on three dimensions:\n\n"
+        "- novelty (0.0-1.0): How surprising to an informed reader?\n"
+        "- relevance (0.0-1.0): How useful for deeper understanding?\n"
+        "- actionability (0.0-1.0): Does it suggest a concrete line of inquiry?\n\n"
+        "Return ONLY valid JSON: {\"novelty\": X, \"relevance\": Y, \"actionability\": Z}"
+    )
 
 
 @dataclass
@@ -69,10 +63,11 @@ class AdversarialEvaluator:
         self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
         self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
         self.model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
+        self.domain = config.domain_preamble
 
     def evaluate(self, insight_text: str) -> EvalResult:
-        advocate_arg = self._chat(ADVOCATE_SYSTEM, f"Evaluate this insight:\n\n{insight_text}")
-        skeptic_arg = self._chat(SKEPTIC_SYSTEM, f"Evaluate this insight:\n\n{insight_text}")
+        advocate_arg = self._chat(_advocate_system(self.domain), f"Evaluate this insight:\n\n{insight_text}")
+        skeptic_arg = self._chat(_skeptic_system(self.domain), f"Evaluate this insight:\n\n{insight_text}")
 
         referee_prompt = (
             f"INSIGHT:\n{insight_text}\n\n"
@@ -80,7 +75,7 @@ class AdversarialEvaluator:
             f"SKEPTIC:\n{skeptic_arg}\n\n"
             f"Score the insight as JSON."
         )
-        referee_resp = self._chat(REFEREE_SYSTEM, referee_prompt)
+        referee_resp = self._chat(_referee_system(self.domain), referee_prompt)
         scores = self._parse_scores(referee_resp)
 
         return EvalResult(

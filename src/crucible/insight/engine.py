@@ -31,42 +31,38 @@ DEFAULT_NOISE_PATTERNS = [
 
 MIN_CHUNK_LENGTH = 80
 
-# ── LLM Prompts ─────────────────────────────────────────────
+# ── LLM Prompt Templates (domain injected at runtime) ──────
 
-_DOMAIN = (
-    "Domain: freight logistics platform (microservices, event-driven). "
-    "Key entities: shipments, quotes, rates, tariffs, legal entities, pricing engine. "
-    "Key services: rates-management-core, pricing, booking-v2-core, shipments. "
-    "V1/V2 migration ongoing. NestJS/TypeScript, MongoDB, PubSub.\n\n"
-)
+def _synthesize_system(domain: str) -> str:
+    return domain + (
+        "You are a knowledge analyst. Given raw data about a connection found "
+        "in a knowledge base, explain in 2-3 sentences what this connection "
+        "means and why it matters. Be specific about what a reader would learn "
+        "from this that they couldn't see from either source alone. "
+        "Do not restate the raw text — interpret it."
+    )
 
-SYNTHESIZE_SYSTEM = _DOMAIN + (
-    "You are a knowledge analyst. Given raw data about a connection found "
-    "in the team's knowledge base, explain in 2-3 sentences what this "
-    "connection means and why it matters. Be specific about what an engineer "
-    "would learn from this that they couldn't see from either source alone. "
-    "Do not restate the raw text — interpret it."
-)
+def _contradiction_system(domain: str) -> str:
+    return domain + (
+        "Two passages from a knowledge base discuss similar topics. "
+        "Determine if they contain a genuine contradiction — incompatible facts, "
+        "claims, or positions about the same entity, event, or process.\n\n"
+        "Surface-level topic overlap is NOT a contradiction. Different perspectives "
+        "are NOT contradictions unless they assert incompatible facts.\n\n"
+        'Respond with JSON only: {"contradiction": true/false, "explanation": "one sentence if true, empty string if false"}'
+    )
 
-CONTRADICTION_SYSTEM = _DOMAIN + (
-    "Two passages from the team's knowledge base discuss similar topics. "
-    "Determine if they contain a genuine contradiction — incompatible facts, "
-    "procedures, or states about the same entity or process.\n\n"
-    "Surface-level topic overlap is NOT a contradiction. Different perspectives "
-    "are NOT contradictions unless they assert incompatible facts.\n\n"
-    'Respond with JSON only: {"contradiction": true/false, "explanation": "one sentence if true, empty string if false"}'
-)
-
-GAP_SYSTEM = _DOMAIN + (
-    "You are reviewing a sample of documents from this team's knowledge base. "
-    "Identify 3-5 concepts, entities, or processes that are REFERENCED or "
-    "ASSUMED but never fully explained. These are knowledge gaps — things "
-    "a new team member would need to look up elsewhere.\n\n"
-    "Focus on domain-specific gaps (not generic software concepts).\n\n"
-    "Respond with JSON array only:\n"
-    '[{"topic": "...", "referenced_in": "brief quote showing the reference", '
-    '"why_gap": "one sentence on why this is a gap"}]'
-)
+def _gap_system(domain: str) -> str:
+    return domain + (
+        "You are reviewing a sample of documents from a knowledge base. "
+        "Identify 3-5 concepts, entities, or phenomena that are REFERENCED or "
+        "ASSUMED but never fully explained. These are knowledge gaps — things "
+        "a new reader would need to look up elsewhere.\n\n"
+        "Focus on domain-specific gaps (not generic common knowledge).\n\n"
+        "Respond with JSON array only:\n"
+        '[{"topic": "...", "referenced_in": "brief quote showing the reference", '
+        '"why_gap": "one sentence on why this is a gap"}]'
+    )
 
 
 # ── Utilities ───────────────────────────────────────────────
@@ -225,7 +221,7 @@ class InsightEngine:
     def _synthesize(self, insight: Insight) -> str:
         """Replace template insight text with LLM-generated explanation."""
         resp = self._llm(
-            SYNTHESIZE_SYSTEM,
+            _synthesize_system(self.config.domain_preamble),
             f"Raw insight data:\n\n{insight.text}",
             max_tokens=250,
         )
@@ -520,7 +516,7 @@ class InsightEngine:
             # Ask LLM to check for contradiction
             try:
                 resp = self._llm(
-                    CONTRADICTION_SYSTEM,
+                    _contradiction_system(self.config.domain_preamble),
                     f"Passage A (from {a['doc_path']}):\n{a['text'][:600]}\n\n"
                     f"Passage B (from {b['doc_path']}):\n{b['text'][:600]}",
                     max_tokens=200,
@@ -582,7 +578,7 @@ class InsightEngine:
 
         try:
             resp = self._llm(
-                GAP_SYSTEM,
+                _gap_system(self.config.domain_preamble),
                 f"Knowledge base sample:\n\n{sample_text}",
                 max_tokens=500,
             )
@@ -715,6 +711,40 @@ class InsightEngine:
         return picked, insights
 
     def _log_reward(self, **kwargs) -> None:
+        kwargs["mode"] = kwargs.get("mode", "insight")
         kwargs["timestamp"] = datetime.now(timezone.utc).isoformat()
         with open(self.reward_log, "a") as f:
             f.write(json.dumps(kwargs, default=str) + "\n")
+
+    def feedback_from_answer(self, evidence_ids: list[str], answer_score: float) -> int:
+        """Bonus reward for insights that contributed to a good answer.
+
+        Called after MCTS search completes. Insights referenced as evidence
+        in high-scoring answer paths get their strategy rewarded in the bandit.
+        """
+        if answer_score < 0.5:
+            return 0  # only reward from good answers
+
+        bonus = answer_score * 0.3  # scaled bonus, not full score
+        rewarded = 0
+
+        for eid in evidence_ids:
+            # Check if this evidence ID is an insight
+            results = self.graph.cypher_read(
+                f"MATCH (i:Insight {{id: '{eid}'}}) RETURN i.strategy AS strategy"
+            )
+            if results:
+                strategy = results[0]["strategy"]
+                arm = strategy.replace("_discovery", "").replace("_detection", "")
+                if arm in self.bandit.alpha:
+                    self.bandit.update(arm, bonus)
+                    self._log_reward(
+                        mode="answer_feedback",
+                        strategy=arm,
+                        score=bonus,
+                        insight_id=eid,
+                        answer_score=answer_score,
+                    )
+                    rewarded += 1
+
+        return rewarded

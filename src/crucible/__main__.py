@@ -23,6 +23,12 @@ def main():
     exp.add_argument("--strategy", default="", help="Force strategy (bridge/outlier/hub/meta)")
     exp.add_argument("--eval", action="store_true", help="Enable adversarial evaluation")
 
+    ans = sub.add_parser("answer", help="MCTS reasoning over the knowledge graph")
+    ans.add_argument("query", help="Question to answer")
+    ans.add_argument("--iterations", type=int, default=0, help="Max MCTS iterations (0=config default)")
+    ans.add_argument("--depth", type=int, default=0, help="Max tree depth (0=config default)")
+    ans.add_argument("--feedback", action="store_true", help="Feed answer scores back to insight bandit")
+
     sub.add_parser("bandit", help="Show Thompson Sampling posteriors")
     sub.add_parser("embed-insights", help="Backfill embeddings on existing insights")
 
@@ -70,6 +76,36 @@ def main():
             print("\nBandit posteriors:")
             for arm, p in sorted(post.items(), key=lambda x: x[1]["mean"], reverse=True):
                 print(f"  {arm:8s}  mean={p['mean']:.3f}  α={p['alpha']:.0f} β={p['beta']:.0f}  obs={p['observations']:.0f}")
+        g.close()
+
+    elif args.command == "answer":
+        from .config import Config
+        from .graph.client import CrucibleGraph
+        from .reasoning.mcts import MCTSEngine
+
+        config = Config()
+        g = CrucibleGraph(config)
+        engine = MCTSEngine(config, g)
+        print(f"MCTS search: \"{args.query}\"")
+        print(f"  max_iterations={args.iterations or config.mcts_max_iterations}, "
+              f"max_depth={args.depth or config.mcts_max_depth}, "
+              f"uct_c={config.mcts_uct_c}")
+        print()
+        tree = engine.search(
+            args.query,
+            max_iterations=args.iterations or None,
+            max_depth=args.depth or None,
+        )
+        print()
+        print(tree.summary())
+
+        if args.feedback:
+            from .insight.engine import InsightEngine
+
+            ie = InsightEngine(config, g)
+            rewarded = ie.feedback_from_answer(tree.evidence_ids, tree.best_score)
+            if rewarded:
+                print(f"\nFeedback: {rewarded} insights rewarded (bonus from answer score {tree.best_score:.3f})")
         g.close()
 
     elif args.command == "stats":

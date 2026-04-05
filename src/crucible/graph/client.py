@@ -5,7 +5,7 @@ import json
 from neo4j import GraphDatabase
 
 from ..config import Config
-from ..models import Chunk, Corpus, Document, Insight
+from ..models import Chunk, Corpus, Document, Insight, ReasoningNode
 from .schema import ensure_schema
 
 
@@ -138,6 +138,32 @@ class CrucibleGraph:
                 )
             ]
 
+    def vector_search_insights(
+        self,
+        embedding: list[float],
+        limit: int = 5,
+        corpus_id: str | None = None,
+    ) -> list[dict]:
+        """Semantic search over insight embeddings.
+
+        Returns insights ranked by cosine similarity to the query embedding.
+        Each result includes the insight text, strategy, score, and source info.
+        Used by MCTS answer mode to include discovered insights as evidence.
+        """
+        q = (
+            "CALL db.index.vector.queryNodes('insight_embedding', $k, $emb) "
+            "YIELD node, score "
+        )
+        if corpus_id:
+            q += "WHERE node.corpus_id = $cid "
+        q += (
+            "RETURN node.id AS id, node.text AS text, node.strategy AS strategy, "
+            "node.score AS insight_score, node.layer AS layer, score "
+            "ORDER BY score DESC"
+        )
+        with self._driver.session() as s:
+            return [dict(r) for r in s.run(q, emb=embedding, k=limit, cid=corpus_id)]
+
     def cypher_read(self, query: str) -> list[dict]:
         blocked = {"CREATE", "DELETE", "SET", "REMOVE", "MERGE", "DROP", "DETACH"}
         tokens = set(query.upper().split())
@@ -259,3 +285,81 @@ class CrucibleGraph:
                 layer=layer,
             ).single()
             return r["updated"] if r else 0
+
+    # ── Reasoning Tree ─────────────────────────────────────
+
+    def upsert_reasoning_node(self, node: ReasoningNode) -> None:
+        with self._driver.session() as s:
+            s.run(
+                "MERGE (rn:ReasoningNode {id: $id}) "
+                "SET rn.tree_id=$tid, rn.query=$q, "
+                "rn.evidence_ids=$ev, rn.partial_answer=$ans, "
+                "rn.action_taken=$act, rn.score=$score, "
+                "rn.visits=$vis, rn.total_score=$ts, "
+                "rn.depth=$depth, rn.context=$ctx, "
+                "rn.created_at=$cat",
+                id=node.id,
+                tid=node.tree_id,
+                q=node.query,
+                ev=node.evidence_ids,
+                ans=node.partial_answer,
+                act=node.action_taken,
+                score=node.score,
+                vis=node.visits,
+                ts=node.total_score,
+                depth=node.depth,
+                ctx=json.dumps(node.context),
+                cat=node.created_at,
+            )
+            if node.parent_id:
+                s.run(
+                    "MATCH (child:ReasoningNode {id: $cid}), "
+                    "(parent:ReasoningNode {id: $pid}) "
+                    "MERGE (child)-[:CHILD_OF]->(parent)",
+                    cid=node.id,
+                    pid=node.parent_id,
+                )
+            # Link evidence (chunks and insights)
+            for eid in node.evidence_ids:
+                s.run(
+                    "MATCH (rn:ReasoningNode {id: $rid}) "
+                    "OPTIONAL MATCH (ch:Chunk {id: $eid}) "
+                    "OPTIONAL MATCH (i:Insight {id: $eid}) "
+                    "FOREACH (_ IN CASE WHEN ch IS NOT NULL THEN [1] ELSE [] END | "
+                    "  MERGE (rn)-[:USES_EVIDENCE]->(ch)) "
+                    "FOREACH (_ IN CASE WHEN i IS NOT NULL THEN [1] ELSE [] END | "
+                    "  MERGE (rn)-[:USES_EVIDENCE]->(i))",
+                    rid=node.id,
+                    eid=eid,
+                )
+
+    def get_reasoning_tree(self, tree_id: str) -> list[dict]:
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (rn:ReasoningNode {tree_id: $tid}) "
+                    "OPTIONAL MATCH (rn)-[:CHILD_OF]->(parent:ReasoningNode) "
+                    "RETURN rn.id AS id, rn.query AS query, "
+                    "rn.partial_answer AS partial_answer, "
+                    "rn.action_taken AS action_taken, "
+                    "rn.score AS score, rn.visits AS visits, "
+                    "rn.total_score AS total_score, "
+                    "rn.depth AS depth, rn.evidence_ids AS evidence_ids, "
+                    "rn.context AS context, "
+                    "parent.id AS parent_id "
+                    "ORDER BY rn.depth, rn.id",
+                    tid=tree_id,
+                )
+            ]
+
+    def backpropagate_score(self, node_id: str, score: float) -> None:
+        """Walk up the tree from node_id to root, updating visits and total_score."""
+        with self._driver.session() as s:
+            s.run(
+                "MATCH path = (leaf:ReasoningNode {id: $nid})-[:CHILD_OF*0..]->(ancestor:ReasoningNode) "
+                "SET ancestor.visits = ancestor.visits + 1, "
+                "ancestor.total_score = ancestor.total_score + $score",
+                nid=node_id,
+                score=score,
+            )

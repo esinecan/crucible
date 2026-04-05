@@ -21,6 +21,10 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX insight_corpus IF NOT EXISTS FOR (i:Insight) ON (i.corpus_id)",
     "CREATE INDEX insight_strategy IF NOT EXISTS FOR (i:Insight) ON (i.strategy)",
     "CREATE INDEX insight_layer IF NOT EXISTS FOR (i:Insight) ON (i.layer)",
+    # Reasoning tree
+    "CREATE CONSTRAINT reasoning_node_id IF NOT EXISTS FOR (rn:ReasoningNode) REQUIRE rn.id IS UNIQUE",
+    "CREATE INDEX reasoning_tree IF NOT EXISTS FOR (rn:ReasoningNode) ON (rn.tree_id)",
+    "CREATE INDEX reasoning_depth IF NOT EXISTS FOR (rn:ReasoningNode) ON (rn.depth)",
 ]
 
 

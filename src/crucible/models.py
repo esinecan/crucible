@@ -55,3 +55,31 @@ class Insight:
     source_insight_ids: list[str] = field(default_factory=list)
     context: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)
+
+
+@dataclass
+class ReasoningNode:
+    """A node in an MCTS reasoning tree."""
+
+    id: str
+    tree_id: str
+    query: str
+    evidence_ids: list[str] = field(default_factory=list)
+    partial_answer: str = ""
+    action_taken: str = ""  # which expansion action produced this node
+    score: float = 0.0
+    visits: int = 0
+    total_score: float = 0.0
+    parent_id: str | None = None
+    children_ids: list[str] = field(default_factory=list)
+    depth: int = 0
+    context: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)
+
+    @property
+    def avg_score(self) -> float:
+        return self.total_score / self.visits if self.visits > 0 else 0.0
+
+    @property
+    def is_leaf(self) -> bool:
+        return len(self.children_ids) == 0
