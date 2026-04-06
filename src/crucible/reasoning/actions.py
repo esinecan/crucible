@@ -29,26 +29,18 @@ class Action(ABC):
 
 
 class SearchAction(Action):
-    """Hybrid vector + fulltext search for evidence, including insights.
+    """Hybrid vector + fulltext + insight + entity search for evidence.
 
-    Three search channels, deduplicated and ranked:
+    Four search channels, deduplicated and ranked:
     1. Vector search on chunk embeddings (semantic similarity)
     2. Fulltext search on chunk text (keyword matching)
     3. Vector search on insight embeddings (discovered patterns)
-
-    A.1: Always embeds the QUERY for the first search (not partial answer).
-         On deeper nodes, embeds a combination of query + challenge context
-         to focus retrieval on what's missing.
-    A.2: Results from all channels merged by ID, best score wins.
-    A.3: Insights included as first-class evidence candidates.
+    4. Entity-based retrieval (find entities in query, get their chunks)
     """
 
     name = "search"
 
     def expand(self, parent: ReasoningNode, graph: CrucibleGraph, config: Config) -> ReasoningNode | None:
-        # A.1: Query-focused search. On first expansion (no evidence yet),
-        # always search for the query itself. On deeper nodes, combine
-        # query with challenge to search for what's missing.
         challenge = parent.context.get("challenge", "")
         if not parent.evidence_ids:
             search_text = parent.query
@@ -59,35 +51,43 @@ class SearchAction(Action):
 
         embedding = embed_text(search_text, config)
         seen = set(parent.evidence_ids)
-        scored: dict[str, tuple[float, dict]] = {}  # id -> (score, result)
+        scored: dict[str, tuple[float, dict]] = {}
 
         # Channel 1: vector search on chunks
         for r in graph.vector_search(embedding, limit=8):
             if r["id"] not in seen:
                 scored[r["id"]] = (r["score"], r)
 
-        # Channel 2: fulltext search on chunks (keyword signal)
+        # Channel 2: fulltext search on chunks
         for r in graph.fulltext_search(parent.query, limit=8):
             if r["id"] not in seen:
                 rid = r["id"]
                 if rid in scored:
-                    # A.2: keep best score from either channel
                     if r["score"] > scored[rid][0]:
                         scored[rid] = (r["score"], r)
                 else:
                     scored[rid] = (r["score"], r)
 
-        # Channel 3: A.3 — insight-aware search
+        # Channel 3: insight-aware search
         for r in graph.vector_search_insights(embedding, limit=5):
             if r["id"] not in seen:
-                # Boost insight score slightly — insights are pre-filtered quality
                 boosted = r["score"] * 1.1
                 scored[r["id"]] = (boosted, r)
+
+        # Channel 4: entity-based retrieval
+        try:
+            entity_hits = graph.entity_search(parent.query, limit=5)
+            for hit in entity_hits:
+                chunks = graph.get_chunks_for_entity(hit["id"])
+                for ch in chunks[:3]:
+                    if ch["id"] not in seen and ch["id"] not in scored:
+                        scored[ch["id"]] = (0.8, ch)
+        except Exception:
+            pass  # no entities or index not ready
 
         if not scored:
             return None
 
-        # Rank by score, take top 10
         ranked = sorted(scored.values(), key=lambda x: x[0], reverse=True)[:10]
         new_evidence = [r["id"] for _, r in ranked]
 
@@ -104,6 +104,7 @@ class SearchAction(Action):
                 "new_evidence_count": len(new_evidence),
                 "search_text": search_text[:100],
                 "insight_evidence": sum(1 for _, r in ranked if "strategy" in r),
+                "entity_evidence": sum(1 for _, r in ranked if "doc_title" in r and r.get("doc_title")),
             },
         )
 
@@ -111,13 +112,11 @@ class SearchAction(Action):
 class FollowRefAction(Action):
     """Traverse graph edges from evidence to find adjacent content.
 
-    Follows three types of edges from the most recent evidence:
+    Follows four types of edges from the most recent evidence:
     - NEXT: sequential chunks in the same document (read ahead)
-    - PART_OF → same Document → other Chunks: sibling chunks from same doc
     - DERIVED_FROM: if evidence is an insight, follow to its source chunks
-
-    This expands context around already-found evidence without a new search,
-    analogous to Burokrat's cross-reference following.
+    - Entity traversal: chunk → entities → related entities → their chunks
+      This is SEMANTIC traversal — following meaning, not document structure.
     """
 
     name = "follow_ref"
@@ -129,6 +128,7 @@ class FollowRefAction(Action):
         recent = parent.evidence_ids[-3:]
         new_evidence = []
         seen = set(parent.evidence_ids)
+        entity_hops = []
 
         for eid in recent:
             # Follow NEXT edges (sequential context)
@@ -146,6 +146,24 @@ class FollowRefAction(Action):
                     seen.add(r["id"])
                     new_evidence.append(r["id"])
 
+            # Entity traversal: chunk → entity → related entity → chunk
+            try:
+                entities = graph.get_entities_for_chunk(eid)
+                for ent in entities[:2]:
+                    related = graph.entity_neighbors(ent["id"], limit=3)
+                    for rel in related:
+                        rel_entity_id = rel["id"]
+                        rel_chunks = graph.get_chunks_for_entity(rel_entity_id)
+                        for ch in rel_chunks[:2]:
+                            if ch["id"] not in seen:
+                                seen.add(ch["id"])
+                                new_evidence.append(ch["id"])
+                                entity_hops.append(
+                                    f"{ent['name']} -[{rel['relation_type']}]-> {rel['name']}"
+                                )
+            except Exception:
+                pass  # no entities yet
+
         if not new_evidence:
             return None
 
@@ -158,7 +176,11 @@ class FollowRefAction(Action):
             action_taken=self.name,
             parent_id=parent.id,
             depth=parent.depth + 1,
-            context={"followed_from": recent, "new_count": len(new_evidence)},
+            context={
+                "followed_from": recent,
+                "new_count": len(new_evidence),
+                "entity_hops": entity_hops[:5],
+            },
         )
 
 
@@ -312,6 +334,70 @@ class SynthesizeAction(Action):
             return ""
 
 
+class EntityWalkAction(Action):
+    """Pure graph traversal from query entities. No embedding, no LLM.
+
+    Extracts entity names from the query via fulltext search on the entity
+    index, then walks the entity graph following typed relations, collecting
+    chunks along the path. Fast and deterministic.
+    """
+
+    name = "entity_walk"
+
+    def expand(self, parent: ReasoningNode, graph: CrucibleGraph, config: Config) -> ReasoningNode | None:
+        # Find entities mentioned in the query
+        try:
+            query_entities = graph.entity_search(parent.query, limit=5)
+        except Exception:
+            return None
+
+        if not query_entities:
+            return None
+
+        seen = set(parent.evidence_ids)
+        new_evidence = []
+        walked_paths = []
+
+        for ent in query_entities[:3]:
+            # Get chunks directly mentioning this entity
+            direct_chunks = graph.get_chunks_for_entity(ent["id"])
+            for ch in direct_chunks[:2]:
+                if ch["id"] not in seen:
+                    seen.add(ch["id"])
+                    new_evidence.append(ch["id"])
+
+            # Walk one hop: entity → related entities → their chunks
+            neighbors = graph.entity_neighbors(ent["id"], limit=5)
+            for rel in neighbors:
+                rel_chunks = graph.get_chunks_for_entity(rel["id"])
+                for ch in rel_chunks[:1]:
+                    if ch["id"] not in seen:
+                        seen.add(ch["id"])
+                        new_evidence.append(ch["id"])
+                        walked_paths.append(
+                            f"{ent['name']} -[{rel['relation_type']}]-> {rel['name']}"
+                        )
+
+        if not new_evidence:
+            return None
+
+        return ReasoningNode(
+            id=uuid.uuid4().hex[:20],
+            tree_id=parent.tree_id,
+            query=parent.query,
+            evidence_ids=parent.evidence_ids + new_evidence,
+            partial_answer=parent.partial_answer,
+            action_taken=self.name,
+            parent_id=parent.id,
+            depth=parent.depth + 1,
+            context={
+                "query_entities": [e["name"] for e in query_entities[:3]],
+                "new_count": len(new_evidence),
+                "walked_paths": walked_paths[:10],
+            },
+        )
+
+
 # ── Action Registry ────────────────────────────────────────
 
 DEFAULT_ACTIONS: list[Action] = [
@@ -319,6 +405,7 @@ DEFAULT_ACTIONS: list[Action] = [
     FollowRefAction(),
     ChallengeAction(),
     SynthesizeAction(),
+    EntityWalkAction(),
 ]
 
 ACTION_REGISTRY: dict[str, Action] = {a.name: a for a in DEFAULT_ACTIONS}

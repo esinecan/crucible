@@ -46,6 +46,16 @@ def _referee_system(domain: str) -> str:
 
 
 @dataclass
+class EvalContext:
+    """Evidence gathered by the harness for evaluator agents."""
+    source_chunks: list[str]       # text of source chunks (max 5, 500 chars each)
+    source_entities: list[str]     # "EntityName (TYPE)" strings
+    related_insights: list[str]    # text of similar existing insights (max 3)
+    entity_paths: list[str]        # "A -[REL]-> B" entity connection strings
+    strategy: str = ""             # which strategy produced this insight
+
+
+@dataclass
 class EvalResult:
     novelty: float
     relevance: float
@@ -65,9 +75,20 @@ class AdversarialEvaluator:
         self.model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
         self.domain = config.domain_preamble
 
-    def evaluate(self, insight_text: str) -> EvalResult:
-        advocate_arg = self._chat(_advocate_system(self.domain), f"Evaluate this insight:\n\n{insight_text}")
-        skeptic_arg = self._chat(_skeptic_system(self.domain), f"Evaluate this insight:\n\n{insight_text}")
+    def evaluate(self, insight_text: str, context: EvalContext | None = None) -> EvalResult:
+        user_msg = f"Evaluate this insight:\n\n{insight_text}"
+        if context:
+            if context.source_chunks:
+                user_msg += "\n\nSOURCE EVIDENCE:\n" + "\n---\n".join(context.source_chunks[:5])
+            if context.source_entities:
+                user_msg += "\n\nENTITIES INVOLVED:\n" + ", ".join(context.source_entities[:10])
+            if context.entity_paths:
+                user_msg += "\n\nENTITY CONNECTIONS:\n" + "\n".join(context.entity_paths[:5])
+            if context.related_insights:
+                user_msg += "\n\nEXISTING RELATED INSIGHTS:\n" + "\n---\n".join(context.related_insights[:3])
+
+        advocate_arg = self._chat(_advocate_system(self.domain), user_msg)
+        skeptic_arg = self._chat(_skeptic_system(self.domain), user_msg)
 
         referee_prompt = (
             f"INSIGHT:\n{insight_text}\n\n"
@@ -100,7 +121,7 @@ class AdversarialEvaluator:
                     {"role": "user", "content": user},
                 ],
                 "temperature": 0.7,
-                "max_tokens": 300,
+                "max_tokens": 400,
             },
             timeout=30.0,
         )

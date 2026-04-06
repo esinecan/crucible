@@ -137,6 +137,54 @@ def reasoning_trees(tree_id: str = "") -> str:
     return json.dumps(results, indent=2, default=str)
 
 
+@mcp.tool()
+def entity_search(query: str, limit: int = 10) -> str:
+    """Search entities by name or description. Returns entities ranked by relevance."""
+    results = graph.entity_search(query, limit=limit)
+    return json.dumps(results, indent=2, default=str)
+
+
+@mcp.tool()
+def entity_graph(entity_name: str, hops: int = 1) -> str:
+    """Get an entity and its neighbors in the knowledge graph.
+
+    Returns the entity, its direct relations, and neighboring entities.
+    Use for exploring how concepts connect in the corpus.
+    """
+    results = graph.entity_search(entity_name, limit=1)
+    if not results:
+        return json.dumps({"error": f"No entity found matching '{entity_name}'"})
+    entity_id = results[0]["id"]
+    neighbors = graph.entity_neighbors(entity_id, limit=20)
+    return json.dumps(
+        {"entity": results[0], "neighbors": neighbors},
+        indent=2, default=str,
+    )
+
+
+@mcp.tool()
+def rate_insight(insight_id: str, score: float) -> str:
+    """Rate an insight with human feedback. Score 0.0-1.0.
+
+    Human feedback is weighted 3x in the Thompson Sampling bandit,
+    making it the strongest signal for strategy selection.
+    """
+    from .insight.engine import InsightEngine
+
+    engine = InsightEngine(config, graph, use_evaluator=False)
+    arm = engine.apply_human_feedback(insight_id, score)
+    if arm:
+        posteriors = engine.bandit.posteriors()
+        return json.dumps({
+            "status": "ok",
+            "strategy": arm,
+            "score": score,
+            "weight": "3x",
+            "posteriors": posteriors,
+        }, indent=2)
+    return json.dumps({"error": f"Insight not found: {insight_id}"})
+
+
 def main():
     mcp.run(transport="stdio")
 

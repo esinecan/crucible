@@ -25,6 +25,16 @@ SCHEMA_STATEMENTS = [
     "CREATE CONSTRAINT reasoning_node_id IF NOT EXISTS FOR (rn:ReasoningNode) REQUIRE rn.id IS UNIQUE",
     "CREATE INDEX reasoning_tree IF NOT EXISTS FOR (rn:ReasoningNode) ON (rn.tree_id)",
     "CREATE INDEX reasoning_depth IF NOT EXISTS FOR (rn:ReasoningNode) ON (rn.depth)",
+    # Entity extraction
+    "CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
+    "CREATE INDEX entity_corpus IF NOT EXISTS FOR (e:Entity) ON (e.corpus_id)",
+    "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.entity_type)",
+    "CREATE INDEX entity_name IF NOT EXISTS FOR (e:Entity) ON (e.name)",
+    "CREATE FULLTEXT INDEX entity_fulltext IF NOT EXISTS "
+    "FOR (e:Entity) ON EACH [e.name, e.description]",
+    "CREATE VECTOR INDEX entity_embedding IF NOT EXISTS "
+    "FOR (e:Entity) ON (e.embedding) "
+    "OPTIONS {indexConfig: {`vector.dimensions`: 768, `vector.similarity_function`: 'cosine'}}",
 ]
 
 

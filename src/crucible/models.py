@@ -83,3 +83,34 @@ class ReasoningNode:
     @property
     def is_leaf(self) -> bool:
         return len(self.children_ids) == 0
+
+
+@dataclass
+class Entity:
+    """A named entity extracted from corpus text via ontology-guided extraction."""
+
+    id: str  # deterministic: hash(corpus_id, entity_type, lower(name))
+    corpus_id: str
+    name: str  # canonical name
+    entity_type: str  # UPPER_SNAKE_CASE from ontology
+    description: str = ""
+    aliases: list[str] = field(default_factory=list)
+    embedding: list[float] = field(default_factory=list)
+    mention_count: int = 1
+    properties: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Relation:
+    """A typed relationship between two entities, extracted from chunk text."""
+
+    id: str  # deterministic: hash(src_id, rel_type, tgt_id, chunk_id)
+    source_entity_id: str
+    target_entity_id: str
+    relation_type: str  # UPPER_SNAKE_CASE from ontology
+    evidence: str = ""  # quote from source text
+    confidence: float = 0.0
+    source_chunk_id: str = ""
+    properties: dict[str, Any] = field(default_factory=dict)
+    created_at: str = field(default_factory=_now)

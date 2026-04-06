@@ -5,7 +5,8 @@ import json
 from neo4j import GraphDatabase
 
 from ..config import Config
-from ..models import Chunk, Corpus, Document, Insight, ReasoningNode
+from ..extraction import sanitize_rel_type
+from ..models import Chunk, Corpus, Document, Entity, Insight, ReasoningNode, Relation
 from .schema import ensure_schema
 
 
@@ -243,18 +244,30 @@ class CrucibleGraph:
 
     def sample_insights(self, n: int = 50, layer: int = 1) -> list[dict]:
         with self._driver.session() as s:
-            return [
-                dict(r)
-                for r in s.run(
-                    "MATCH (i:Insight) "
-                    "WHERE i.layer = $layer AND i.embedding IS NOT NULL "
-                    "RETURN i.id AS id, i.text AS text, i.embedding AS embedding, "
-                    "i.strategy AS strategy, i.score AS original_score, "
-                    "rand() AS r ORDER BY r LIMIT $n",
-                    layer=layer,
-                    n=n,
-                )
-            ]
+            rows = []
+            for r in s.run(
+                "MATCH (i:Insight) "
+                "WHERE i.layer = $layer AND i.embedding IS NOT NULL "
+                "OPTIONAL MATCH (i)-[:DERIVED_FROM]->(ch:Chunk) "
+                "RETURN i.id AS id, i.text AS text, i.embedding AS embedding, "
+                "i.strategy AS strategy, i.score AS original_score, "
+                "i.context AS context, "
+                "collect(ch.id) AS source_chunk_ids, "
+                "rand() AS r ORDER BY r LIMIT $n",
+                layer=layer,
+                n=n,
+            ):
+                d = dict(r)
+                # Parse context from Neo4j string if needed
+                if isinstance(d.get("context"), str):
+                    try:
+                        d["context"] = json.loads(d["context"])
+                    except (json.JSONDecodeError, TypeError):
+                        d["context"] = {}
+                elif d.get("context") is None:
+                    d["context"] = {}
+                rows.append(d)
+            return rows
 
     def get_unembedded_insights(self, batch_size: int = 100) -> list[dict]:
         with self._driver.session() as s:
@@ -352,6 +365,210 @@ class CrucibleGraph:
                     tid=tree_id,
                 )
             ]
+
+    # ── Entity Extraction ──────────────────────────────────
+
+    def upsert_entity(self, entity: Entity) -> None:
+        with self._driver.session() as s:
+            s.run(
+                "MERGE (e:Entity {id: $id}) "
+                "ON CREATE SET e.corpus_id=$cid, e.name=$name, "
+                "  e.entity_type=$etype, e.description=$desc, "
+                "  e.aliases=$aliases, e.embedding=$emb, "
+                "  e.mention_count=1, e.properties=$props, e.created_at=$ts "
+                "ON MATCH SET e.mention_count = e.mention_count + 1, "
+                "  e.description = CASE WHEN size(e.description) < size($desc) "
+                "    THEN $desc ELSE e.description END, "
+                "  e.aliases = CASE WHEN size(e.aliases) < size($aliases) "
+                "    THEN $aliases ELSE e.aliases END",
+                id=entity.id,
+                cid=entity.corpus_id,
+                name=entity.name,
+                etype=entity.entity_type,
+                desc=entity.description,
+                aliases=entity.aliases,
+                emb=entity.embedding or None,
+                props=json.dumps(entity.properties),
+                ts=entity.created_at,
+            )
+
+    def upsert_relation(self, relation: Relation) -> None:
+        """Create a typed relationship between entities via dynamic Cypher.
+
+        Safe because relation_type comes from our ontology and is sanitized
+        to [A-Z0-9_] only before interpolation.
+        """
+        rel_type = sanitize_rel_type(relation.relation_type)
+        query = (
+            f"MATCH (src:Entity {{id: $src_id}}), (tgt:Entity {{id: $tgt_id}}) "
+            f"MERGE (src)-[r:{rel_type} {{id: $rid}}]->(tgt) "
+            f"SET r.evidence=$ev, r.confidence=$conf, "
+            f"r.source_chunk_id=$cid, r.properties=$props, r.created_at=$ts"
+        )
+        with self._driver.session() as s:
+            s.run(
+                query,
+                src_id=relation.source_entity_id,
+                tgt_id=relation.target_entity_id,
+                rid=relation.id,
+                ev=relation.evidence,
+                conf=relation.confidence,
+                cid=relation.source_chunk_id,
+                props=json.dumps(relation.properties),
+                ts=relation.created_at,
+            )
+
+    def link_entity_to_chunk(self, entity_id: str, chunk_id: str) -> None:
+        with self._driver.session() as s:
+            s.run(
+                "MATCH (e:Entity {id: $eid}), (ch:Chunk {id: $cid}) "
+                "MERGE (e)-[:MENTIONED_IN]->(ch)",
+                eid=entity_id,
+                cid=chunk_id,
+            )
+
+    def entity_search(self, query: str, limit: int = 10) -> list[dict]:
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "CALL db.index.fulltext.queryNodes('entity_fulltext', $q) "
+                    "YIELD node, score "
+                    "RETURN node.id AS id, node.name AS name, "
+                    "node.entity_type AS entity_type, "
+                    "node.description AS description, "
+                    "node.mention_count AS mention_count, score "
+                    "ORDER BY score DESC LIMIT $lim",
+                    q=query,
+                    lim=limit,
+                )
+            ]
+
+    def entity_neighbors(self, entity_id: str, limit: int = 20) -> list[dict]:
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (e:Entity {id: $eid})-[r]-(neighbor:Entity) "
+                    "RETURN neighbor.id AS id, neighbor.name AS name, "
+                    "neighbor.entity_type AS entity_type, "
+                    "type(r) AS relation_type, "
+                    "startNode(r).id AS from_id, endNode(r).id AS to_id, "
+                    "r.evidence AS evidence, r.confidence AS confidence "
+                    "ORDER BY r.confidence DESC LIMIT $lim",
+                    eid=entity_id,
+                    lim=limit,
+                )
+            ]
+
+    def get_entities_for_chunk(self, chunk_id: str) -> list[dict]:
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (e:Entity)-[:MENTIONED_IN]->(ch:Chunk {id: $cid}) "
+                    "RETURN e.id AS id, e.name AS name, "
+                    "e.entity_type AS entity_type, "
+                    "e.description AS description",
+                    cid=chunk_id,
+                )
+            ]
+
+    def get_chunks_for_entity(self, entity_id: str) -> list[dict]:
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (e:Entity {id: $eid})-[:MENTIONED_IN]->(ch:Chunk)"
+                    "-[:PART_OF]->(d:Document) "
+                    "RETURN ch.id AS id, ch.text AS text, "
+                    "d.path AS doc_path, d.title AS doc_title "
+                    "ORDER BY d.path, ch.position",
+                    eid=entity_id,
+                )
+            ]
+
+    def get_unextracted_chunks(
+        self, corpus_id: str, batch_size: int = 50
+    ) -> list[dict]:
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (ch:Chunk)-[:PART_OF]->(d:Document {corpus_id: $cid}) "
+                    "WHERE NOT exists((ch)-[:EXTRACTION_DONE]->(:Corpus {id: $cid})) "
+                    "RETURN ch.id AS id, ch.text AS text, "
+                    "ch.heading AS heading, d.path AS doc_path "
+                    "LIMIT $n",
+                    cid=corpus_id,
+                    n=batch_size,
+                )
+            ]
+
+    def mark_chunk_extracted(self, chunk_id: str, corpus_id: str) -> None:
+        with self._driver.session() as s:
+            s.run(
+                "MATCH (ch:Chunk {id: $cid}), (co:Corpus {id: $corp}) "
+                "MERGE (ch)-[:EXTRACTION_DONE]->(co)",
+                cid=chunk_id,
+                corp=corpus_id,
+            )
+
+    def get_all_chunk_texts(self, corpus_id: str, only_missing: bool = False) -> list[dict]:
+        """Get chunk IDs and texts for a corpus.
+
+        If only_missing=True, returns only chunks where embedding IS NULL.
+        """
+        q = "MATCH (ch:Chunk)-[:PART_OF]->(d:Document {corpus_id: $cid}) "
+        if only_missing:
+            q += "WHERE ch.embedding IS NULL "
+        q += "RETURN ch.id AS id, ch.text AS text ORDER BY ch.id"
+        with self._driver.session() as s:
+            return [dict(r) for r in s.run(q, cid=corpus_id)]
+
+    def get_unembedded_entities(self, corpus_id: str) -> list[dict]:
+        """Get entities without embeddings."""
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (e:Entity {corpus_id: $cid}) "
+                    "WHERE e.embedding IS NULL "
+                    "RETURN e.id AS id, e.name AS name, e.description AS desc",
+                    cid=corpus_id,
+                )
+            ]
+
+    def set_chunk_embeddings(self, updates: list[tuple[str, list[float]]]) -> None:
+        """Bulk update chunk embeddings."""
+        with self._driver.session() as s:
+            s.run(
+                "UNWIND $rows AS r "
+                "MATCH (ch:Chunk {id: r.id}) "
+                "SET ch.embedding = r.embedding",
+                rows=[{"id": uid, "embedding": emb} for uid, emb in updates],
+            )
+
+    def set_entity_embeddings(self, updates: list[tuple[str, list[float]]]) -> None:
+        """Bulk update entity embeddings."""
+        with self._driver.session() as s:
+            s.run(
+                "UNWIND $rows AS r "
+                "MATCH (e:Entity {id: r.id}) "
+                "SET e.embedding = r.embedding",
+                rows=[{"id": uid, "embedding": emb} for uid, emb in updates],
+            )
+
+    def entity_stats(self) -> dict:
+        with self._driver.session() as s:
+            r = s.run(
+                "OPTIONAL MATCH (e:Entity) WITH count(e) AS entities "
+                "OPTIONAL MATCH (:Entity)-[r]->(:Entity) "
+                "WHERE type(r) <> 'MENTIONED_IN' "
+                "WITH entities, count(r) AS relations "
+                "RETURN entities, relations"
+            ).single()
+            return dict(r) if r else {}
 
     def backpropagate_score(self, node_id: str, score: float) -> None:
         """Walk up the tree from node_id to root, updating visits and total_score."""
