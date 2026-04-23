@@ -1264,6 +1264,14 @@ class InsightEngine:
         if insights:
             self._write_cycle_artifacts(cycle_dir, "evaluated", insights)
 
+        # Pre-persist grounding check (off by default). Drops insights whose
+        # claim is contradicted by their source chunk; marks unsupported
+        # insights so their bandit reward is discounted. L2 (meta) skipped
+        # because their grounding is in their L1 sources, not chunks; if
+        # those L1s passed grounding, the L2 inherits that confidence.
+        if getattr(self.config, "grounding_check", False):
+            insights = self._filter_by_grounding(insights, picked)
+
         # Persist and log
         for insight in insights:
             if persist:
@@ -1282,6 +1290,10 @@ class InsightEngine:
             )
             # Discount heuristic scores so they don't dominate the posterior
             bandit_score = insight.score if self.evaluator else insight.score * 0.5
+            # Further discount if grounding flagged the insight as unsupported
+            # (claim neither supported nor contradicted by its source chunk).
+            if insight.context.get("grounding") == "unsupported":
+                bandit_score *= 0.5
             self.bandit.update(picked, bandit_score)
 
         # Artifact 3: final persisted insights
@@ -1290,9 +1302,116 @@ class InsightEngine:
 
         return picked, insights, cycle_dir
 
+    # ── Grounding Check ───────────────────────────────────
+
+    _GROUNDING_DROP_CONFIDENCE = 0.7
+
+    def _ground_check(self, insight: Insight) -> tuple[str, float]:
+        """Ask the LLM whether the insight's claim is grounded in its source.
+
+        Samples the first source chunk, presents it alongside the insight
+        text, and requests a verdict in {support, contradict, unsupported}
+        with a 0–1 confidence. Returns ('unsupported', 0.0) on any failure
+        (no source chunk, chunk fetch error, LLM error, malformed JSON) so a
+        broken grounding call is treated conservatively rather than
+        masquerading as approval.
+        """
+        if not insight.source_chunk_ids:
+            return ("unsupported", 0.0)
+        chunk_id = insight.source_chunk_ids[0]
+        try:
+            rows = self.graph.cypher_read(
+                "MATCH (c:Chunk {id: $cid}) RETURN c.text AS text LIMIT 1",
+                cid=chunk_id,
+            )
+        except Exception:
+            return ("unsupported", 0.0)
+        if not rows or not rows[0].get("text"):
+            return ("unsupported", 0.0)
+        chunk_text = rows[0]["text"][:800]
+
+        try:
+            result = self._llm_client.chat_json(
+                self.config.domain_preamble + (
+                    "You are a grounding checker. Given a CLAIM extracted "
+                    "from a knowledge base and a piece of SOURCE TEXT from "
+                    "that same knowledge base, decide whether the source "
+                    "supports, contradicts, or is silent on the claim.\n\n"
+                    "Use 'contradict' only when the source asserts something "
+                    "incompatible with the claim. Use 'unsupported' when the "
+                    "source is silent or only partially relevant. Use "
+                    "'support' when the source clearly establishes the claim.\n\n"
+                    'Reply JSON only: {"verdict": "support"|"contradict"'
+                    '|"unsupported", "confidence": 0.0-1.0}'
+                ),
+                f"CLAIM:\n{insight.text[:600]}\n\nSOURCE TEXT:\n{chunk_text}",
+                temperature=0.1,
+                max_tokens=120,
+            )
+        except Exception:
+            return ("unsupported", 0.0)
+
+        if not isinstance(result, dict):
+            return ("unsupported", 0.0)
+        verdict = str(result.get("verdict", "unsupported")).lower().strip()
+        if verdict not in ("support", "contradict", "unsupported"):
+            verdict = "unsupported"
+        try:
+            confidence = max(0.0, min(1.0, float(result.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return (verdict, confidence)
+
+    def _filter_by_grounding(
+        self, insights: list[Insight], strategy: str,
+    ) -> list[Insight]:
+        """Run _ground_check on every L1 insight; drop contradicted ones,
+        mark unsupported ones for downstream discount.
+
+        L2 (meta) insights bypass this check — their claims are abstractions
+        over multiple L1s, and their grounding is transitively covered by
+        whatever passed at the L1 layer. Running grounding against a single
+        sampled chunk would always return 'unsupported' for L2 because no
+        single chunk contains a meta-bridge.
+
+        Dropped insights are recorded to the reward log with mode
+        'dropped_grounding' so the audit trail is preserved.
+        """
+        kept: list[Insight] = []
+        for insight in insights:
+            if insight.layer != 1:
+                kept.append(insight)
+                continue
+            verdict, confidence = self._ground_check(insight)
+            insight.context["grounding"] = verdict
+            insight.context["grounding_confidence"] = confidence
+            if (
+                verdict == "contradict"
+                and confidence >= self._GROUNDING_DROP_CONFIDENCE
+            ):
+                logger.info(
+                    "grounding: dropped %s [%s] confidence=%.2f",
+                    insight.id[:12], strategy, confidence,
+                )
+                self._log_reward(
+                    mode="dropped_grounding",
+                    strategy=strategy,
+                    score=0.0,
+                    insight_id=insight.id,
+                    grounding_confidence=confidence,
+                )
+                continue
+            kept.append(insight)
+        return kept
+
     def _log_reward(self, **kwargs) -> None:
         kwargs["mode"] = kwargs.get("mode", "insight")
         kwargs["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Per-corpus state_dir paths may not exist yet on first write; the
+        # bandit snapshot creates its own parent, but reward log writes
+        # happen first when grounding drops an insight before any bandit
+        # update runs.
+        self.reward_log.parent.mkdir(parents=True, exist_ok=True)
         with open(self.reward_log, "a") as f:
             f.write(json.dumps(kwargs, default=str) + "\n")
 

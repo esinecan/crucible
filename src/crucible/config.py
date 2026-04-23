@@ -86,6 +86,22 @@ class Config:
         ]
     )
 
+    # Pre-persist grounding check. When enabled, every L1 insight gets one
+    # extra LLM call after the evaluator runs: the model is shown the
+    # insight's claim and one of its source chunks and asked whether the
+    # source supports, contradicts, or is silent on the claim. Contradicted
+    # insights at confidence >= 0.7 are dropped before persist; unsupported
+    # insights are persisted with a `context.grounding='unsupported'` marker
+    # and their bandit reward is halved. Off by default because it doubles
+    # per-insight LLM cost; the cocrucible gap hallucinations would all be
+    # caught by it (every gap claim was directly refutable by reading any
+    # chunk of the source it referenced).
+    grounding_check: bool = field(
+        default_factory=lambda: os.getenv(
+            "CRUCIBLE_GROUNDING_CHECK", ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+    )
+
     domain_context: str = field(
         default_factory=lambda: os.getenv("CRUCIBLE_DOMAIN", "")
     )
