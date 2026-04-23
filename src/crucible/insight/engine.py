@@ -39,6 +39,34 @@ DEFAULT_NOISE_PATTERNS = [
 
 MIN_CHUNK_LENGTH = 80
 
+# Entity types whose "referenced more than mentioned" pattern is a normal
+# property of the domain rather than a knowledge gap. Code corpora emit
+# entities like MODULE, INSIGHT_ENGINE, EXTRACTION_PIPELINE that get
+# referenced by many callers but defined in one chunk — the historical gap
+# heuristic treats every well-encapsulated function as a gap. For these
+# types we apply a stricter incoming-vs-mentions threshold so only severely
+# under-covered entities surface. Membership covers the explicit set below
+# plus token-based fallback for anything containing 'MODULE', 'COMPONENT',
+# 'METHOD', 'FUNCTION', 'CLASS', 'ENGINE', 'PIPELINE', 'ALGORITHM' so an
+# unfamiliar code-corpus ontology still gets the relaxed treatment.
+CODE_LIKE_ENTITY_TYPES: set[str] = {
+    "MODULE", "COMPONENT", "METHOD", "FUNCTION", "CLASS",
+    "INSIGHT_ENGINE", "KNOWLEDGE_GRAPH", "EXTRACTION_PIPELINE",
+    "REASONING_STRATEGY", "ONTOLOGY",
+}
+_CODE_TYPE_TOKENS: tuple[str, ...] = (
+    "MODULE", "COMPONENT", "METHOD", "FUNCTION", "CLASS",
+    "ENGINE", "PIPELINE", "ALGORITHM",
+)
+
+
+def _is_code_like_type(entity_type: str | None) -> bool:
+    if not entity_type:
+        return False
+    if entity_type in CODE_LIKE_ENTITY_TYPES:
+        return True
+    return any(token in entity_type for token in _CODE_TYPE_TOKENS)
+
 # ── LLM Prompt Templates (domain injected at runtime) ──────
 
 def _synthesize_system(domain: str) -> str:
@@ -126,16 +154,27 @@ class ThompsonBandit:
         arms: list[str],
         update_mode: str = "pseudo_count",
         snapshot_path: str | Path | None = None,
+        disabled: set[str] | list[str] | None = None,
     ):
         self.alpha: dict[str, float] = {a: 1.0 for a in arms}
         self.beta: dict[str, float] = {a: 1.0 for a in arms}
         self._update_mode = update_mode
         self._snapshot_path = Path(snapshot_path) if snapshot_path else None
+        # Disabled arms are filtered at select() time. They still accept
+        # update() calls so that explicit --strategy overrides keep their
+        # posteriors current — the user disabled the strategy from the
+        # bandit's autonomous selection, not from manual operation.
+        self._disabled: set[str] = set(disabled or [])
 
     def select(self) -> str:
+        eligible = [arm for arm in self.alpha if arm not in self._disabled]
+        # Safety: if the user disables every arm, fall back to the full set
+        # rather than crash with max() on empty. select() must always return.
+        if not eligible:
+            eligible = list(self.alpha)
         samples = {
             arm: random.betavariate(self.alpha[arm], self.beta[arm])
-            for arm in self.alpha
+            for arm in eligible
         }
         return max(samples, key=samples.get)
 
@@ -258,6 +297,7 @@ class InsightEngine:
             STRATEGIES,
             update_mode=getattr(config, "bandit_update_mode", "pseudo_count"),
             snapshot_path=self.reward_log.with_suffix(".snapshot.json"),
+            disabled=getattr(config, "disabled_strategies", None),
         )
         # Snapshot first; only fall back to log replay on cold start (or
         # corrupted snapshot). Once load_from_log finishes it writes a
@@ -1024,6 +1064,15 @@ class InsightEngine:
 
         return insights
 
+    # Stricter gap thresholds for code-like entity types. The default
+    # heuristic (`incoming > mentions`) treats every well-encapsulated
+    # function as a knowledge gap because callers reference it without
+    # being its definition. For code-like types we require the gap to be
+    # severe — large absolute deficit AND very few direct mentions — so
+    # only entities that are genuinely under-covered surface.
+    _GAP_CODE_MIN_DIFF = 5
+    _GAP_CODE_MAX_MENTIONS = 2
+
     def _entity_gap_candidates(
         self, corpus_id: str | None
     ) -> list[tuple[float, str, str, int, int]]:
@@ -1033,6 +1082,15 @@ class InsightEngine:
         `mentions` counts distinct chunks whose Mentions resolve to it.
         When incoming > mentions, the entity is talked ABOUT without being
         covered directly — classic knowledge gap.
+
+        For code-like entity types (see `_is_code_like_type` and
+        `CODE_LIKE_ENTITY_TYPES`) the threshold tightens to
+        `incoming - mentions >= _GAP_CODE_MIN_DIFF` AND
+        `mentions <= _GAP_CODE_MAX_MENTIONS` — the prose-style "any deficit
+        is a gap" rule misfires on code where functions are defined once
+        and called many times. Cocrucible's gap channel produced 4/4
+        hallucinations under the relaxed rule; the stricter rule lets only
+        entities that are genuinely under-covered through.
         """
         with self.graph._driver.session() as s:
             rows = [
@@ -1048,18 +1106,41 @@ class InsightEngine:
                     "WHERE mentions < incoming "
                     "RETURN e.name AS name, e.entity_type AS type, "
                     "incoming, mentions "
-                    "ORDER BY incoming - mentions DESC LIMIT 15"
+                    "ORDER BY incoming - mentions DESC LIMIT 30"
                 )
             ]
 
-        results = []
+        return self._filter_gap_rows(rows)
+
+    @classmethod
+    def _filter_gap_rows(
+        cls, rows: list[dict], max_results: int = 15,
+    ) -> list[tuple[float, str, str, int, int]]:
+        """Pure: apply the code-aware threshold + scoring to gap candidate rows.
+
+        Extracted so it can be unit-tested without a Neo4j round-trip; called
+        by _entity_gap_candidates after the Cypher fetch.
+        """
+        results: list[tuple[float, str, str, int, int]] = []
         for row in rows:
-            gap_ratio = (row["incoming"] - row["mentions"]) / max(row["incoming"], 1)
+            incoming = row["incoming"]
+            mentions = row["mentions"]
+            etype = row["type"]
+            if _is_code_like_type(etype):
+                # Stricter rule for code corpora: require severe deficit
+                # AND a sparse direct presence. Most well-encapsulated
+                # functions and classes will not pass.
+                if (incoming - mentions) < cls._GAP_CODE_MIN_DIFF:
+                    continue
+                if mentions > cls._GAP_CODE_MAX_MENTIONS:
+                    continue
+            gap_ratio = (incoming - mentions) / max(incoming, 1)
             score = min(0.6 + 0.4 * gap_ratio, 1.0)
             results.append((
-                score, row["name"], row["type"],
-                row["incoming"], row["mentions"],
+                score, row["name"], etype, incoming, mentions,
             ))
+            if len(results) >= max_results:
+                break
         return results
 
     # ── Insight Embedding ───────────────────────────────────

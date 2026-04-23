@@ -71,6 +71,21 @@ class Config:
         )
     )
 
+    # Strategy escape hatch. Comma-separated names (bridge, outlier, hub,
+    # meta, contradiction, gap) excluded from Thompson Sampling selection.
+    # The gap strategy fires false positives on code corpora because every
+    # called function is "referenced more than mentioned" — a power user who
+    # knows their corpus type can disable gap (or any other ill-fitting
+    # strategy) without waiting for the bandit to learn it the slow way.
+    # An explicit `--strategy gap` CLI flag still overrides this.
+    disabled_strategies: list[str] = field(
+        default_factory=lambda: [
+            s.strip()
+            for s in os.getenv("CRUCIBLE_DISABLED_STRATEGIES", "").split(",")
+            if s.strip()
+        ]
+    )
+
     domain_context: str = field(
         default_factory=lambda: os.getenv("CRUCIBLE_DOMAIN", "")
     )

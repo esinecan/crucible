@@ -395,6 +395,36 @@ class TestEngineCorpusStateRouting:
         eng_b2 = InsightEngine(config, graph, corpus_id="corp-B", use_evaluator=False)
         assert eng_b2.bandit.posteriors()["hub"]["alpha"] == 1.0
 
+    def test_disabled_strategies_excluded_from_select(self):
+        """ThompsonBandit.select must skip arms in the disabled set even
+        when their posterior would otherwise win. The cocrucible diagnosis
+        identified gap as a misfiring strategy on code corpora — power users
+        should be able to disable it without waiting for the bandit to learn
+        gap is bad through hundreds of low-quality observations."""
+        random.seed(0)
+        b = ThompsonBandit(STRATEGIES, disabled={"gap"})
+        # Give gap a strong posterior; under normal sampling it would dominate.
+        for _ in range(200):
+            b.update("gap", 1.0)
+        # 200 selections — gap should never appear.
+        for _ in range(200):
+            assert b.select() != "gap"
+
+    def test_disabled_strategies_falls_back_when_all_disabled(self):
+        """Safety: if every arm is disabled, select() returns from the full
+        pool rather than crashing with max() on an empty sequence."""
+        b = ThompsonBandit(["a", "b"], disabled=["a", "b"])
+        result = b.select()
+        assert result in ("a", "b")
+
+    def test_disabled_strategies_still_accepts_updates(self):
+        """update() must keep working on disabled arms so explicit --strategy
+        overrides keep their posteriors current. Disabling is about bandit
+        autonomous selection, not about freezing the arm's state."""
+        b = ThompsonBandit(STRATEGIES, disabled={"gap"})
+        b.update("gap", 0.7)
+        assert b.alpha["gap"] == pytest.approx(1.7)
+
     def test_corpus_state_dir_isolates_snapshot_files(self, tmp_path):
         """Snapshot files for two corpora live in different directories on
         disk — any tooling that backs up a corpus's bandit state can scope
