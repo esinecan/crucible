@@ -2,18 +2,24 @@
 
 Thompson Sampling lives in insight/engine.py; UCB1 ActionBandit in
 reasoning/mcts.py. Both are thin and deterministic once you control RNG.
+
+Per-corpus state routing is tested at the bottom — InsightEngine and
+MCTSEngine accept a corpus_id and route reward log + snapshot paths to
+`<state_dir>/<corpus_id>/` so each corpus has independent bandit posteriors.
 """
 from __future__ import annotations
 
 import random
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from crucible.insight.engine import STRATEGIES, ThompsonBandit
+from crucible.config import Config
+from crucible.insight.engine import STRATEGIES, InsightEngine, ThompsonBandit
 from crucible.models import ReasoningNode
 from crucible.reasoning.actions import SearchAction, SynthesizeAction
-from crucible.reasoning.mcts import ActionBandit
+from crucible.reasoning.mcts import ActionBandit, MCTSEngine
 
 
 class TestThompsonBandit:
@@ -317,3 +323,90 @@ class TestActionBanditSnapshot:
         )
         # Still 1 visit — snapshot authoritative, log ignored.
         assert ab2.stats()["search"]["visits"] == 1
+
+
+class TestEngineCorpusStateRouting:
+    """InsightEngine and MCTSEngine route reward log + bandit snapshot
+    through `<state_dir>/<corpus_id>/` when corpus_id is set, so per-corpus
+    bandits don't share state. Empty corpus_id keeps legacy CWD paths so
+    existing scripts remain functional and the historical mixed-corpus
+    reward log is left in place rather than stranded."""
+
+    def _config(self, tmp_path) -> Config:
+        return Config(state_dir=str(tmp_path / "state"))
+
+    def test_insight_engine_with_corpus_id_routes_to_state_dir(self, tmp_path):
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        eng = InsightEngine(config, graph, corpus_id="corp-A", use_evaluator=False)
+        expected = Path(config.state_dir) / "corp-A" / "insight_rewards.jsonl"
+        assert eng.reward_log == expected
+
+    def test_insight_engine_empty_corpus_id_falls_back_to_cwd(self, tmp_path):
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        eng = InsightEngine(config, graph, use_evaluator=False)
+        # Legacy: CWD-relative path, exactly as before T1.
+        assert eng.reward_log == Path("insight_rewards.jsonl")
+
+    def test_explicit_reward_log_arg_wins_over_corpus_id(self, tmp_path):
+        """Tests pass an explicit reward_log; that arg must override the
+        corpus_id-derived path so existing test fixtures keep working."""
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        explicit = tmp_path / "explicit.jsonl"
+        eng = InsightEngine(
+            config, graph, reward_log=explicit, corpus_id="corp-A",
+            use_evaluator=False,
+        )
+        assert eng.reward_log == explicit
+
+    def test_mcts_engine_with_corpus_id_routes_to_state_dir(self, tmp_path):
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        eng = MCTSEngine(config, graph, corpus_id="corp-A")
+        expected = Path(config.state_dir) / "corp-A" / "answer_rewards.jsonl"
+        assert eng.reward_log == expected
+
+    def test_mcts_engine_empty_corpus_id_falls_back_to_cwd(self, tmp_path):
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        eng = MCTSEngine(config, graph)
+        assert eng.reward_log == Path("answer_rewards.jsonl")
+
+    def test_two_corpora_get_independent_bandit_posteriors(self, tmp_path):
+        """Two engines on the same graph, two different corpus_ids, independent
+        Beta posteriors. Without this, a Yepis-warmed bandit would steer
+        cocrucible discovery — exactly the cross-corpus pollution that the
+        meta-strategy experiment surfaced."""
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        eng_a = InsightEngine(config, graph, corpus_id="corp-A", use_evaluator=False)
+        eng_b = InsightEngine(config, graph, corpus_id="corp-B", use_evaluator=False)
+        # Pump one update into A only; B's posteriors stay at the prior.
+        eng_a.bandit.update("hub", 0.9)
+        eng_a.bandit.update("hub", 0.85)
+        post_a = eng_a.bandit.posteriors()
+        post_b = eng_b.bandit.posteriors()
+        assert post_a["hub"]["alpha"] > post_b["hub"]["alpha"]
+        assert post_b["hub"]["alpha"] == 1.0  # untouched prior
+        # Reload B from its (empty) snapshot dir — should still see priors,
+        # not any of A's updates.
+        eng_b2 = InsightEngine(config, graph, corpus_id="corp-B", use_evaluator=False)
+        assert eng_b2.bandit.posteriors()["hub"]["alpha"] == 1.0
+
+    def test_corpus_state_dir_isolates_snapshot_files(self, tmp_path):
+        """Snapshot files for two corpora live in different directories on
+        disk — any tooling that backs up a corpus's bandit state can scope
+        to its own dir."""
+        config = self._config(tmp_path)
+        graph = MagicMock()
+        eng_a = InsightEngine(config, graph, corpus_id="corp-A", use_evaluator=False)
+        eng_b = InsightEngine(config, graph, corpus_id="corp-B", use_evaluator=False)
+        eng_a.bandit.update("bridge", 0.7)
+        eng_b.bandit.update("outlier", 0.4)
+        snap_a = Path(config.state_dir) / "corp-A" / "insight_rewards.snapshot.json"
+        snap_b = Path(config.state_dir) / "corp-B" / "insight_rewards.snapshot.json"
+        assert snap_a.exists()
+        assert snap_b.exists()
+        assert snap_a != snap_b

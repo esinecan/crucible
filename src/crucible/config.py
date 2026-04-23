@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 @dataclass
@@ -55,6 +56,19 @@ class Config:
     # this many calls have been made and reports remaining-dirty count.
     max_synthesis_calls: int = field(
         default_factory=lambda: int(os.getenv("CRUCIBLE_MAX_SYNTHESIS_CALLS", "500"))
+    )
+
+    # Per-corpus state directory. When a corpus_id is supplied to InsightEngine
+    # or MCTSEngine, reward logs and bandit snapshots are routed to
+    # `<state_dir>/<corpus_id>/` so a Yepis-warmed bandit doesn't steer
+    # discovery on a fresh corpus. When no corpus_id is supplied, the engines
+    # fall back to the historical CWD-based paths (`./insight_rewards.jsonl`
+    # etc.) so existing scripts keep working.
+    state_dir: str = field(
+        default_factory=lambda: os.getenv(
+            "CRUCIBLE_STATE_DIR",
+            str(Path.home() / ".crucible"),
+        )
     )
 
     domain_context: str = field(

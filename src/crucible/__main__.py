@@ -31,8 +31,10 @@ def main():
     ans.add_argument("--iterations", type=int, default=0, help="Max MCTS iterations (0=config default)")
     ans.add_argument("--depth", type=int, default=0, help="Max tree depth (0=config default)")
     ans.add_argument("--feedback", action="store_true", help="Feed answer scores back to insight bandit")
+    ans.add_argument("--corpus", default="", help="Corpus name or id; routes action-bandit state per corpus (legacy: empty = CWD reward log)")
 
-    sub.add_parser("bandit", help="Show Thompson Sampling posteriors")
+    band = sub.add_parser("bandit", help="Show Thompson Sampling posteriors")
+    band.add_argument("--corpus", default="", help="Show per-corpus posteriors (default: legacy CWD bandit)")
     sub.add_parser("embed-insights", help="Backfill embeddings on existing insights")
 
     reemb = sub.add_parser("re-embed", help="Re-embed corpus with current backend")
@@ -88,7 +90,21 @@ def main():
         config = Config()
         g = CrucibleGraph(config)
         do_persist = not (args.dry_run or args.no_persist)
-        engine = InsightEngine(config, g, use_evaluator=not args.no_eval)
+        # Resolve --corpus to a canonical id so the engine can route bandit
+        # state to <state_dir>/<corpus_id>/ instead of inheriting the global
+        # CWD reward log. Empty --corpus means cross-corpus run; falls back
+        # to legacy paths.
+        corpus_id_for_state = ""
+        if args.corpus:
+            try:
+                corpus_id_for_state = g.resolve_corpus_id(args.corpus)
+            except ValueError:
+                corpus_id_for_state = args.corpus  # opaque pass-through; engine still uses it for path
+        engine = InsightEngine(
+            config, g,
+            use_evaluator=not args.no_eval,
+            corpus_id=corpus_id_for_state,
+        )
         if args.no_eval:
             print("Evaluation disabled (heuristic mode)")
         else:
@@ -98,7 +114,11 @@ def main():
         total = 0
         for c in range(args.cycles):
             strat, insights, cycle_dir = engine.run_cycle(
-                corpus_id=args.corpus or None,
+                # Use resolved id so persisted Insight nodes have the canonical
+                # hashed corpus_id; the historical fallback (raw user input)
+                # left insights with un-resolvable corpus_id values that never
+                # matched downstream queries.
+                corpus_id=corpus_id_for_state or None,
                 max_insights=args.max,
                 strategy=args.strategy or None,
                 output_dir=args.output_dir or None,
@@ -129,7 +149,16 @@ def main():
 
         config = Config()
         g = CrucibleGraph(config)
-        engine = MCTSEngine(config, g)
+        # Resolve --corpus to canonical id for action-bandit state routing.
+        # Empty --corpus keeps the legacy CWD-based answer_rewards.jsonl
+        # behavior so existing scripts and trees stay readable.
+        corpus_id_for_state = ""
+        if args.corpus:
+            try:
+                corpus_id_for_state = g.resolve_corpus_id(args.corpus)
+            except ValueError:
+                corpus_id_for_state = args.corpus
+        engine = MCTSEngine(config, g, corpus_id=corpus_id_for_state)
         print(f"MCTS search: \"{args.query}\"")
         print(f"  max_iterations={args.iterations or config.mcts_max_iterations}, "
               f"max_depth={args.depth or config.mcts_max_depth}, "
@@ -410,9 +439,16 @@ def main():
 
         config = Config()
         g = CrucibleGraph(config)
-        engine = InsightEngine(config, g)
+        corpus_id_for_state = ""
+        if args.corpus:
+            try:
+                corpus_id_for_state = g.resolve_corpus_id(args.corpus)
+            except ValueError:
+                corpus_id_for_state = args.corpus
+        engine = InsightEngine(config, g, corpus_id=corpus_id_for_state)
+        scope = f"corpus={corpus_id_for_state}" if corpus_id_for_state else "legacy/CWD"
         post = engine.bandit.posteriors()
-        print("Thompson Sampling posteriors:")
+        print(f"Thompson Sampling posteriors ({scope}):")
         for arm, p in sorted(post.items(), key=lambda x: x[1]["mean"], reverse=True):
             print(f"  {arm:8s}  mean={p['mean']:.3f}  α={p['alpha']:.0f} β={p['beta']:.0f}  obs={p['observations']:.0f}")
         g.close()

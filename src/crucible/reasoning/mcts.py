@@ -193,12 +193,25 @@ class MCTSEngine:
         referee: Referee | None = None,
         actions: list[Action] | None = None,
         reward_log: str | Path | None = None,
+        corpus_id: str = "",
     ):
         self.config = config
         self.graph = graph
+        self.corpus_id = corpus_id
         self.referee = referee or LLMReferee(config)
         self.actions = actions or list(ACTION_REGISTRY.values())
-        self.reward_log = Path(reward_log) if reward_log else Path("answer_rewards.jsonl")
+        # Mirror InsightEngine's path routing: explicit reward_log wins,
+        # then per-corpus state_dir, then legacy CWD fallback. Action
+        # bandit gets its own per-corpus posterior so a query against
+        # one corpus doesn't influence the action selection on another.
+        if reward_log is not None:
+            self.reward_log = Path(reward_log)
+        elif corpus_id:
+            self.reward_log = (
+                Path(config.state_dir) / corpus_id / "answer_rewards.jsonl"
+            )
+        else:
+            self.reward_log = Path("answer_rewards.jsonl")
         self.action_bandit = ActionBandit(
             self.actions,
             c=config.mcts_uct_c,

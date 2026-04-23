@@ -229,10 +229,26 @@ class InsightEngine:
         reward_log: str | Path | None = None,
         noise_patterns: list[str] | None = None,
         use_evaluator: bool = True,
+        corpus_id: str = "",
     ):
         self.config = config
         self.graph = graph
-        self.reward_log = Path(reward_log) if reward_log else Path("insight_rewards.jsonl")
+        self.corpus_id = corpus_id
+        # Reward log + snapshot routing:
+        # - Explicit `reward_log` arg wins (used by tests).
+        # - Else, if corpus_id is set, route through `<state_dir>/<corpus_id>/`
+        #   so each corpus has its own bandit posteriors.
+        # - Else, fall back to legacy CWD path so existing scripts still work
+        #   and the historical mixed-corpus reward log keeps living at the
+        #   repo root.
+        if reward_log is not None:
+            self.reward_log = Path(reward_log)
+        elif corpus_id:
+            self.reward_log = (
+                Path(config.state_dir) / corpus_id / "insight_rewards.jsonl"
+            )
+        else:
+            self.reward_log = Path("insight_rewards.jsonl")
         self.noise_patterns = noise_patterns if noise_patterns is not None else DEFAULT_NOISE_PATTERNS
         self._llm_client = LLMClient(config)
         self.bandit = ThompsonBandit(
