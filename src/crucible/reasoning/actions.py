@@ -6,15 +6,13 @@ and selectable by the MCTS engine.
 """
 from __future__ import annotations
 
-import os
 import uuid
 from abc import ABC, abstractmethod
-
-import httpx
 
 from ..config import Config
 from ..embeddings import embed_text
 from ..graph.client import CrucibleGraph
+from ..llm_client import LLMClient
 from ..models import ReasoningNode
 
 
@@ -129,38 +127,22 @@ class SearchAction(Action):
 
     def _expand_query(self, query: str, config: Config) -> list[str]:
         """Generate alternative facet queries to reach distant semantic neighborhoods."""
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
         try:
-            resp = httpx.post(
-                f"{base_url}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": config.domain_preamble + (
-                                "Generate 4 alternative search queries that explore DIFFERENT "
-                                "conceptual facets of the user's question. Each query should "
-                                "target a different angle that a direct semantic search would "
-                                "miss: adjacent frameworks, counter-arguments, primary source "
-                                "claims, structural analogies, or implicit assumptions.\n\n"
-                                "Return ONLY a JSON array of 4 strings, nothing else."
-                            ),
-                        },
-                        {"role": "user", "content": query},
-                    ],
-                    "temperature": 0.5,
-                    "max_tokens": 300,
-                },
-                timeout=30.0,
+            text = LLMClient(config).chat(
+                config.domain_preamble + (
+                    "Generate 4 alternative search queries that explore DIFFERENT "
+                    "conceptual facets of the user's question. Each query should "
+                    "target a different angle that a direct semantic search would "
+                    "miss: adjacent frameworks, counter-arguments, primary source "
+                    "claims, structural analogies, or implicit assumptions.\n\n"
+                    "Return ONLY a JSON array of 4 strings, nothing else."
+                ),
+                query,
+                temperature=0.5,
+                max_tokens=300,
             )
-            resp.raise_for_status()
             import json as _json
             import re as _re
-            text = resp.json()["choices"][0]["message"]["content"]
             match = _re.search(r"\[.*\]", text, _re.DOTALL)
             if match:
                 queries = _json.loads(match.group())
@@ -273,33 +255,17 @@ class ChallengeAction(Action):
         )
 
     def _prosecute(self, query: str, answer: str, config: Config) -> str:
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
         try:
-            resp = httpx.post(
-                f"{base_url}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": config.domain_preamble + (
-                                "You are a prosecutor stress-testing an answer. Find gaps, "
-                                "unsupported claims, missing evidence, logical errors, and "
-                                "counter-arguments. Be specific. 2-3 sentences."
-                            ),
-                        },
-                        {"role": "user", "content": f"Query: {query}\n\nAnswer: {answer}"},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 300,
-                },
-                timeout=30.0,
+            return LLMClient(config).chat(
+                config.domain_preamble + (
+                    "You are a prosecutor stress-testing an answer. Find gaps, "
+                    "unsupported claims, missing evidence, logical errors, and "
+                    "counter-arguments. Be specific. 2-3 sentences."
+                ),
+                f"Query: {query}\n\nAnswer: {answer}",
+                temperature=0.3,
+                max_tokens=300,
             )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
         except Exception:
             return ""
 
@@ -358,10 +324,6 @@ class SynthesizeAction(Action):
         )
 
     def _synthesize(self, query: str, evidence: list[str], prior_answer: str, challenge: str, config: Config) -> str:
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
-
         evidence_block = "\n---\n".join(evidence)
         user_msg = f"Query: {query}\n\nEvidence:\n{evidence_block}"
         if prior_answer:
@@ -370,42 +332,29 @@ class SynthesizeAction(Action):
             user_msg += f"\n\nChallenge to address:\n{challenge}"
 
         try:
-            resp = httpx.post(
-                f"{base_url}/v1/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": config.domain_preamble + (
-                                "You are a knowledge analyst with expertise in conceptual "
-                                "transfer — extracting generalizable principles from specific "
-                                "contexts and applying them to novel questions.\n\n"
-                                "Your process:\n"
-                                "1. EXTRACT: For each evidence chunk, identify any generalizable "
-                                "principle, analytical framework, or diagnostic lens it "
-                                "establishes. State each principle in domain-independent terms.\n"
-                                "2. APPLY: Map each extracted principle to the query. Show "
-                                "specifically how the principle transfers — what does it explain, "
-                                "challenge, or reframe about the question?\n"
-                                "3. SYNTHESIZE: Build your answer from the applied principles, "
-                                "citing the evidence that establishes each one.\n\n"
-                                "If refining a prior answer, focus on principles the prior "
-                                "answer missed or misapplied. Address any challenge by finding "
-                                "principles in the evidence that counter it.\n\n"
-                                "Be specific. Name the principles. Show the transfer logic."
-                            ),
-                        },
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 1000,
-                },
-                timeout=30.0,
+            return LLMClient(config).chat(
+                config.domain_preamble + (
+                    "You are a knowledge analyst with expertise in conceptual "
+                    "transfer — extracting generalizable principles from specific "
+                    "contexts and applying them to novel questions.\n\n"
+                    "Your process:\n"
+                    "1. EXTRACT: For each evidence chunk, identify any generalizable "
+                    "principle, analytical framework, or diagnostic lens it "
+                    "establishes. State each principle in domain-independent terms.\n"
+                    "2. APPLY: Map each extracted principle to the query. Show "
+                    "specifically how the principle transfers — what does it explain, "
+                    "challenge, or reframe about the question?\n"
+                    "3. SYNTHESIZE: Build your answer from the applied principles, "
+                    "citing the evidence that establishes each one.\n\n"
+                    "If refining a prior answer, focus on principles the prior "
+                    "answer missed or misapplied. Address any challenge by finding "
+                    "principles in the evidence that counter it.\n\n"
+                    "Be specific. Name the principles. Show the transfer logic."
+                ),
+                user_msg,
+                temperature=0.3,
+                max_tokens=1000,
             )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
         except Exception:
             return ""
 

@@ -72,7 +72,9 @@ def _patch_extractor(monkeypatch, mapping: dict[str, tuple[list, list]]):
 
 class TestExtractCorpusHappyPath:
     def test_entities_deduped_across_chunks(self, graph, config, fake_embed, monkeypatch):
-        """Alice extracted from all 3 chunks → one Entity, source_chunks=[ch-0,ch-1,ch-2]."""
+        """Alice extracted from all 3 chunks → one Entity. Chunk provenance
+        now lives on the three Mention nodes between Chunks and Entity, not
+        on Entity.source_chunks."""
         _seed_corpus(graph, fake_embed)
         _patch_extractor(monkeypatch, {
             "ch-0": ([{"name": "Alice", "type": "PERSON", "description": "alice short"}], []),
@@ -89,12 +91,15 @@ class TestExtractCorpusHappyPath:
 
         alice_id = make_entity_id("c1", "PERSON", "Alice")
         rows = graph.cypher_read(
-            "MATCH (e:Entity {id: $eid}) "
-            "RETURN e.source_chunks AS chunks, e.description AS desc",
+            "MATCH (ch:Chunk)-[:EXTRACTS]->(:Mention)-[:RESOLVES_TO]->"
+            "(e:Entity {id: $eid}) "
+            "RETURN collect(DISTINCT ch.id) AS chunks, e.description AS desc",
             eid=alice_id,
         )
         assert sorted(rows[0]["chunks"]) == ["ch-0", "ch-1", "ch-2"]
-        assert rows[0]["desc"] == "alice longer description"  # longest wins
+        # Bootstrap description: longest seen during this run, until
+        # synthesizer rewrites it.
+        assert rows[0]["desc"] == "alice longer description"
 
     def test_relations_deduped_across_chunks(self, graph, config, fake_embed, monkeypatch):
         """Same (Alice WORKS_AT Acme) claim in two chunks → one Relation."""
@@ -124,7 +129,13 @@ class TestExtractCorpusHappyPath:
         assert len(rows) == 1
         assert sorted(rows[0]["chunks"]) == ["ch-0", "ch-1"]
 
-    def test_mentioned_in_edges_created(self, graph, config, fake_embed, monkeypatch):
+    def test_mention_edges_created(self, graph, config, fake_embed, monkeypatch):
+        """The MENTIONED_IN edge is gone; provenance now hops through Mention.
+
+        After extraction we should see exactly one Mention per (chunk, entity)
+        pair, with EXTRACTS coming from the chunk and RESOLVES_TO pointing at
+        the canonical entity.
+        """
         _seed_corpus(graph, fake_embed)
         _patch_extractor(monkeypatch, {
             "ch-0": ([{"name": "Alice", "type": "PERSON"}], []),
@@ -135,12 +146,45 @@ class TestExtractCorpusHappyPath:
         extractor.extract_corpus("c1", embed=True, workers=2)
 
         rows = graph.cypher_read(
-            "MATCH (e:Entity)-[:MENTIONED_IN]->(ch:Chunk) "
-            "RETURN e.name AS name, collect(ch.id) AS chunks"
+            "MATCH (ch:Chunk)-[:EXTRACTS]->(m:Mention)-[:RESOLVES_TO]->(e:Entity) "
+            "RETURN e.name AS name, collect(ch.id) AS chunks, "
+            "collect(m.id) AS mentions"
         )
         assert len(rows) == 1
         assert rows[0]["name"] == "Alice"
         assert sorted(rows[0]["chunks"]) == ["ch-0", "ch-1"]
+        # One Mention per (chunk, entity) — two pairs here, two distinct ids.
+        assert len(set(rows[0]["mentions"])) == 2
+
+    def test_mention_provenance_via_helpers(self, graph, config, fake_embed, monkeypatch):
+        """get_entities_for_chunk and get_chunks_for_entity must traverse the
+        new Mention hop transparently — callers shouldn't see the schema shift.
+        """
+        _seed_corpus(graph, fake_embed)
+        _patch_extractor(monkeypatch, {
+            "ch-0": ([{"name": "Alice", "type": "PERSON"}], []),
+            "ch-1": ([{"name": "Alice", "type": "PERSON"}], []),
+            "ch-2": ([{"name": "Bob", "type": "PERSON"}], []),
+        })
+        EntityExtractor(config, graph, _fake_ontology()).extract_corpus(
+            "c1", embed=True, workers=2,
+        )
+
+        from crucible.extraction import make_entity_id
+        alice_id = make_entity_id("c1", "PERSON", "Alice")
+        bob_id = make_entity_id("c1", "PERSON", "Bob")
+
+        # ch-0 mentions Alice only
+        ents = graph.get_entities_for_chunk("ch-0")
+        assert {e["name"] for e in ents} == {"Alice"}
+
+        # Alice appears in ch-0 + ch-1
+        chunks = graph.get_chunks_for_entity(alice_id)
+        assert sorted(c["id"] for c in chunks) == ["ch-0", "ch-1"]
+
+        # Bob only in ch-2
+        chunks = graph.get_chunks_for_entity(bob_id)
+        assert [c["id"] for c in chunks] == ["ch-2"]
 
     def test_all_chunks_marked_extracted(self, graph, config, fake_embed, monkeypatch):
         _seed_corpus(graph, fake_embed)

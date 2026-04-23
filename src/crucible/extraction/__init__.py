@@ -41,3 +41,14 @@ def make_relation_id(src_id: str, rel_type: str, tgt_id: str) -> str:
     """
     raw = ":".join([src_id, rel_type, tgt_id])
     return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def make_mention_id(chunk_id: str, entity_id: str) -> str:
+    """Deterministic mention ID from (chunk, entity).
+
+    One Mention per (chunk, entity) pair — idempotent under re-extraction of
+    the same chunk. Surface form and description live on the Mention itself,
+    not in the identity.
+    """
+    raw = ":".join([chunk_id, entity_id])
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]

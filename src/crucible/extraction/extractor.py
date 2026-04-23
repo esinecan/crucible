@@ -1,10 +1,7 @@
 """Ontology-guided entity and relation extraction from chunk text."""
 from __future__ import annotations
 
-import json
 import logging
-import os
-import re
 import time
 
 import httpx
@@ -13,6 +10,7 @@ from tqdm import tqdm
 from ..config import Config
 from ..embeddings import embed_batch
 from ..graph.client import CrucibleGraph
+from ..llm_client import LLMClient, parse_json_lenient
 from ..models import Entity
 from .aggregate import aggregate_document_extractions
 from .ontology import Ontology
@@ -66,27 +64,6 @@ Return JSON only:
 }}"""
 
 
-def _parse_json_lenient(text: str) -> dict | list | None:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
-        m = re.search(pattern, text)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
-    return None
-
-
 class EntityExtractor:
     def __init__(self, config: Config, graph: CrucibleGraph, ontology: Ontology):
         self.config = config
@@ -95,6 +72,7 @@ class EntityExtractor:
         self._ontology_prompt = ontology.to_extraction_prompt()
         self._valid_types = ontology.class_names
         self._valid_rels = ontology.relation_names
+        self._llm_client = LLMClient(config)
 
     def extract_corpus(
         self,
@@ -215,7 +193,7 @@ class EntityExtractor:
         user = f"Text chunk (from {doc_path}):\n\n{chunk['text']}"
 
         resp = self._llm(system, user, max_tokens=1000)
-        parsed = _parse_json_lenient(resp)
+        parsed = parse_json_lenient(resp)
         if not parsed or not isinstance(parsed, dict):
             return [], []
 
@@ -233,14 +211,20 @@ class EntityExtractor:
             entity.embedding = emb
 
     def _persist_aggregation(self, agg, corpus_id: str) -> None:
-        """Write aggregated entities + relations; link entities to their
-        mention chunks. Each upsert method is individually transactional; a
-        partial failure here leaves a consistent-but-incomplete document.
+        """Write aggregated entities, mentions, and relations.
+
+        Order matters: entities first (Mentions reference them via
+        RESOLVES_TO), then mentions (also requires the chunks to exist —
+        they were upserted earlier in the ingestion pipeline), then relations
+        (between entities, doesn't depend on Mentions). Each upsert method is
+        individually transactional; a partial failure here leaves a
+        consistent-but-incomplete document.
         """
         for entity in agg.entities.values():
             self.graph.upsert_entity(entity)
-            for cid in entity.source_chunks:
-                self.graph.link_entity_to_chunk(entity.id, cid)
+
+        for mention in agg.mentions.values():
+            self.graph.upsert_mention(mention)
 
         for relation in agg.relations.values():
             self.graph.upsert_relation(relation)
@@ -250,35 +234,15 @@ class EntityExtractor:
 
         Non-retryable HTTP errors (auth, 4xx) and malformed payloads raise
         without retry. On exhaustion the original transient error propagates.
+        Wraps LLMClient.chat — the retry policy is extractor-domain logic
+        (chunk-level recoverability) and stays out of the shared client.
         """
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
-        body = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0.2,
-            "max_tokens": max_tokens,
-        }
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                resp = httpx.post(
-                    f"{base_url}/v1/chat/completions",
-                    headers=headers,
-                    json=body,
-                    timeout=60.0,
+                return self._llm_client.chat(
+                    system, user, temperature=0.2, max_tokens=max_tokens,
                 )
-                resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
             except Exception as exc:
                 last_exc = exc
                 if _is_transient(exc) and attempt < 2:

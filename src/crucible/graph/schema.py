@@ -35,6 +35,10 @@ SCHEMA_STATEMENTS = [
     "CREATE VECTOR INDEX entity_embedding IF NOT EXISTS "
     "FOR (e:Entity) ON (e.embedding) "
     "OPTIONS {indexConfig: {`vector.dimensions`: 768, `vector.similarity_function`: 'cosine'}}",
+    # Mention — per-chunk provenance node sitting between Chunk and Entity.
+    "CREATE CONSTRAINT mention_id IF NOT EXISTS FOR (m:Mention) REQUIRE m.id IS UNIQUE",
+    "CREATE INDEX mention_chunk IF NOT EXISTS FOR (m:Mention) ON (m.chunk_id)",
+    "CREATE INDEX mention_entity IF NOT EXISTS FOR (m:Mention) ON (m.entity_id)",
 ]
 
 

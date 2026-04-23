@@ -40,22 +40,37 @@ class ActionBandit:
     invocations.
     """
 
+    SNAPSHOT_VERSION = 1
+
     def __init__(
         self,
         actions: list[Action],
         c: float = 1.41,
         persistence_log: str | Path | None = None,
+        snapshot_path: str | Path | None = None,
     ):
         self._actions = {a.name: a for a in actions}
         self._visits: dict[str, int] = {a.name: 0 for a in actions}
         self._total: dict[str, float] = {a.name: 0.0 for a in actions}
         self._c = c
         self._persistence_log = Path(persistence_log) if persistence_log else None
-        if self._persistence_log:
+        # Auto-derive snapshot path from log path unless explicitly provided.
+        if snapshot_path is not None:
+            self._snapshot_path: Path | None = Path(snapshot_path)
+        elif self._persistence_log is not None:
+            self._snapshot_path = self._persistence_log.with_suffix(".snapshot.json")
+        else:
+            self._snapshot_path = None
+        # Snapshot first; only fall back to log replay on cold start.
+        if not self._load_snapshot() and self._persistence_log:
             self._load_from_log(self._persistence_log)
 
     def _load_from_log(self, path: Path) -> None:
-        """Replay answer_action entries to reconstruct visit/score state."""
+        """Replay answer_action entries to reconstruct visit/score state.
+
+        Deterministic — no random calls — but slow at scale and bounded by log
+        size. Snapshot short-circuits this on subsequent boots.
+        """
         if not path.exists():
             return
         for line in path.read_text().splitlines():
@@ -72,6 +87,39 @@ class ActionBandit:
             if action in self._visits and isinstance(score, (int, float)):
                 self._visits[action] += 1
                 self._total[action] += float(score)
+        self._write_snapshot()
+
+    def _load_snapshot(self) -> bool:
+        if not self._snapshot_path or not self._snapshot_path.exists():
+            return False
+        try:
+            data = json.loads(self._snapshot_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return False
+        if data.get("version") != self.SNAPSHOT_VERSION:
+            return False
+        visits = data.get("visits", {})
+        totals = data.get("totals", {})
+        for name in self._visits:
+            if name in visits and name in totals:
+                self._visits[name] = int(visits[name])
+                self._total[name] = float(totals[name])
+        return True
+
+    def _write_snapshot(self) -> None:
+        if not self._snapshot_path:
+            return
+        try:
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": self.SNAPSHOT_VERSION,
+                "visits": dict(self._visits),
+                "totals": dict(self._total),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._snapshot_path.write_text(json.dumps(data, indent=2))
+        except OSError:
+            pass
 
     def select(self, node: ReasoningNode) -> Action:
         """Pick the best action for this node via UCB1.
@@ -107,7 +155,8 @@ class ActionBandit:
 
     def update(self, action_name: str, score: float) -> None:
         """Update action stats after observing a score. Appends to the
-        persistence log if configured.
+        persistence log (audit trail) and rewrites the snapshot (state) if
+        configured.
         """
         if action_name not in self._visits:
             return
@@ -124,6 +173,7 @@ class ActionBandit:
                     }) + "\n")
             except Exception:
                 pass  # persistence is best-effort; don't break the bandit
+        self._write_snapshot()
 
     def stats(self) -> dict[str, dict]:
         return {

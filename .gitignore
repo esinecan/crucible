@@ -6,6 +6,8 @@ dist/
 build/
 insight_rewards.jsonl
 answer_rewards.jsonl
+insight_rewards.snapshot.json
+answer_rewards.snapshot.json
 .crucible_progress.json
 .nous_progress.json
 

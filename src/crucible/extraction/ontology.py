@@ -15,15 +15,12 @@ Strategy → ontology construct mapping:
 from __future__ import annotations
 
 import json
-import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import httpx
-
 from ..config import Config
 from ..graph.client import CrucibleGraph
+from ..llm_client import LLMClient, parse_json_lenient
 from . import sanitize_type_name
 
 
@@ -165,31 +162,11 @@ Return JSON only:
 }}"""
 
 
-def _parse_json_lenient(text: str) -> dict | list | None:
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
-        m = re.search(pattern, text)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
-    return None
-
-
 class OntologyGenerator:
     def __init__(self, config: Config, graph: CrucibleGraph):
         self.config = config
         self.graph = graph
+        self._llm_client = LLMClient(config)
 
     def generate(self, corpus_id: str) -> Ontology:
         insights = self._load_insights(corpus_id)
@@ -235,35 +212,14 @@ class OntologyGenerator:
         return "\n".join(sections)
 
     def _llm_generate(self, insights: dict[str, list[dict]]) -> str:
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
-
         system = ONTOLOGY_SYSTEM.format(domain=self.config.domain_preamble)
         user = self._build_user_prompt(insights)
-
-        resp = httpx.post(
-            f"{base_url}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 2000,
-            },
-            timeout=60.0,
+        return self._llm_client.chat(
+            system, user, temperature=0.3, max_tokens=2000,
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
 
     def _parse_response(self, raw: str, corpus_id: str) -> Ontology:
-        parsed = _parse_json_lenient(raw)
+        parsed = parse_json_lenient(raw)
         if not parsed or not isinstance(parsed, dict):
             raise ValueError(f"Failed to parse ontology response: {raw[:200]}")
 

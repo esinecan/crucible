@@ -87,12 +87,15 @@ class ReasoningNode:
 
 @dataclass
 class Entity:
-    """A named entity extracted from corpus text via ontology-guided extraction.
+    """A canonical entity — synthesized truth about a named thing.
 
-    source_chunks carries provenance: every chunk whose extraction contributed
-    to this entity. mention_count is derived from len(source_chunks) rather
-    than stored, eliminating the overlap-inflation bug in the old per-call
-    increment scheme.
+    Entity is what we believe; Mention is what a specific chunk asserted.
+    Keeping them separate lets us audit per-chunk provenance without mutating
+    Entity state, and lets a synthesizer refine Entity.description from the
+    union of Mentions without racing with the extraction pipeline.
+
+    Source chunks are no longer stored on Entity — they're derived on read
+    from `(m:Mention)<-[:EXTRACTS]-(:Chunk)` where `m-[:RESOLVES_TO]->entity`.
     """
 
     id: str  # deterministic: hash(corpus_id, entity_type, lower(name))
@@ -102,7 +105,29 @@ class Entity:
     description: str = ""
     aliases: list[str] = field(default_factory=list)
     embedding: list[float] = field(default_factory=list)
-    source_chunks: list[str] = field(default_factory=list)
+    properties: dict[str, Any] = field(default_factory=dict)
+    last_synthesized_at: str = ""  # ISO timestamp; empty = never synthesized
+    created_at: str = field(default_factory=_now)
+
+
+@dataclass
+class Mention:
+    """A single chunk's raw extraction of an entity. Immutable.
+
+    One Mention per (chunk, entity) pair. `name_as_extracted` preserves the
+    surface form in that chunk even when the canonical Entity.name differs
+    (e.g. chunk said "Al", canonical is "Alice"). Description and aliases
+    live here because each chunk asserts its own view; the synthesizer folds
+    them into Entity.description downstream.
+    """
+
+    id: str  # deterministic: hash(chunk_id, entity_id)
+    chunk_id: str
+    entity_id: str  # resolves to canonical Entity
+    name_as_extracted: str  # surface form in this chunk
+    description: str = ""
+    aliases: list[str] = field(default_factory=list)
+    confidence: float = 1.0
     properties: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)
 

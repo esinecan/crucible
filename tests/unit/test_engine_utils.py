@@ -1,5 +1,7 @@
 """Tests for insight/engine.py pure utilities: _cosine, _doc_distance,
-_is_noisy, _parse_json_lenient.
+_is_noisy. JSON parsing was hoisted to llm_client.parse_json_lenient and
+its tests now live in test_llm_client.py — kept here as a re-export so any
+downstream caller importing from engine still works.
 """
 from __future__ import annotations
 
@@ -11,8 +13,8 @@ from crucible.insight.engine import (
     _cosine,
     _doc_distance,
     _is_noisy,
-    _parse_json_lenient,
 )
+from crucible.llm_client import parse_json_lenient as _parse_json_lenient
 
 
 class TestCosine:

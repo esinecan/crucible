@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from crucible.extraction import make_entity_id, make_relation_id
+from crucible.extraction import make_entity_id, make_mention_id, make_relation_id
 from crucible.extraction.aggregate import aggregate_document_extractions
 
 
@@ -57,8 +57,14 @@ class TestEntityAggregation:
         assert len(agg.entities) == 1
         eid = make_entity_id("c1", "PERSON", "Alice")
         assert agg.entities[eid].name == "Alice"
-        assert agg.entities[eid].source_chunks == ["ch-1"]
+        # Source chunks now derived from Mentions, not stored on Entity.
+        assert agg.entity_chunks[eid] == {"ch-1"}
         assert agg.entities[eid].description == "A person"
+        # And we got exactly one Mention for the (chunk, entity) pair.
+        mid = make_mention_id("ch-1", eid)
+        assert mid in agg.mentions
+        assert agg.mentions[mid].chunk_id == "ch-1"
+        assert agg.mentions[mid].entity_id == eid
 
     def test_same_entity_across_chunks_unions_source_chunks(self):
         chunks = [
@@ -69,7 +75,12 @@ class TestEntityAggregation:
         agg = aggregate_document_extractions(chunks, "c1", VALID_TYPES, VALID_RELS)
         assert len(agg.entities) == 1
         eid = make_entity_id("c1", "PERSON", "Alice")
-        assert sorted(agg.entities[eid].source_chunks) == ["ch-1", "ch-2", "ch-3"]
+        assert agg.entity_chunks[eid] == {"ch-1", "ch-2", "ch-3"}
+        # One Mention per (chunk, entity) — three chunks, three Mentions, all
+        # pointing at the same Entity.
+        mention_chunks = sorted(m.chunk_id for m in agg.mentions.values()
+                                if m.entity_id == eid)
+        assert mention_chunks == ["ch-1", "ch-2", "ch-3"]
 
     def test_longer_description_wins(self):
         chunks = [
@@ -240,13 +251,18 @@ class TestAliasResolution:
 
 class TestProvenance:
     def test_entity_source_chunks_are_deduplicated(self):
-        """Same chunk's dict-level repeat doesn't double-count."""
+        """Same chunk's dict-level repeat doesn't double-count source chunks
+        (now expressed as one Mention per (chunk, entity) pair)."""
         chunks = [
             ("ch-1", [_ent("Alice"), _ent("Alice", desc="dup")], []),
         ]
         agg = aggregate_document_extractions(chunks, "c1", VALID_TYPES, VALID_RELS)
         eid = make_entity_id("c1", "PERSON", "Alice")
-        assert agg.entities[eid].source_chunks == ["ch-1"]
+        assert agg.entity_chunks[eid] == {"ch-1"}
+        # Two raw extractions, one (chunk, entity) Mention.
+        per_pair = [m for m in agg.mentions.values() if m.entity_id == eid]
+        assert len(per_pair) == 1
+        assert per_pair[0].chunk_id == "ch-1"
 
     def test_relation_source_chunks_are_deduplicated(self):
         chunks = [
@@ -257,3 +273,70 @@ class TestProvenance:
         agg = aggregate_document_extractions(chunks, "c1", VALID_TYPES, VALID_RELS)
         rel = next(iter(agg.relations.values()))
         assert rel.source_chunks == ["ch-1"]
+
+
+class TestMentionContract:
+    """Mention is the per-chunk provenance node. The contract:
+    - one Mention per (chunk, entity) pair, idempotent on re-extraction
+    - name_as_extracted preserves the surface form even when canonical differs
+    - aliases and description live on the Mention (chunk's view), not Entity
+    """
+
+    def test_one_mention_per_chunk_entity_pair(self):
+        chunks = [
+            ("ch-1", [_ent("Alice", "PERSON")], []),
+            ("ch-2", [_ent("Alice", "PERSON")], []),
+            ("ch-1", [_ent("Alice", "PERSON")], []),  # duplicate (chunk, entity)
+        ]
+        agg = aggregate_document_extractions(chunks, "c1", VALID_TYPES, VALID_RELS)
+        eid = make_entity_id("c1", "PERSON", "Alice")
+        # Two Mentions: (ch-1, Alice) and (ch-2, Alice). The third tuple's
+        # second extraction of Alice in ch-1 collapses by mention_id.
+        for_alice = [m for m in agg.mentions.values() if m.entity_id == eid]
+        assert len(for_alice) == 2
+        assert {m.chunk_id for m in for_alice} == {"ch-1", "ch-2"}
+
+    def test_mention_id_is_deterministic(self):
+        agg = aggregate_document_extractions(
+            [("ch-7", [_ent("Bob", "PERSON")], [])],
+            "c1", VALID_TYPES, VALID_RELS,
+        )
+        eid = make_entity_id("c1", "PERSON", "Bob")
+        expected_mid = make_mention_id("ch-7", eid)
+        assert expected_mid in agg.mentions
+
+    def test_name_as_extracted_preserved_per_chunk(self):
+        """Two chunks extract the same canonical entity with different surface
+        forms — both Mentions retain their respective surface form."""
+        chunks = [
+            # In ch-1 the model said "Alice"; in ch-2 it said "Ms. Alice".
+            # Same canonical entity (PERSON name "Alice" lower-cased).
+            ("ch-1", [_ent("Alice", "PERSON")], []),
+            ("ch-2", [_ent("Alice", "PERSON", aliases=["Ms. Alice"])], []),
+        ]
+        agg = aggregate_document_extractions(chunks, "c1", VALID_TYPES, VALID_RELS)
+        eid = make_entity_id("c1", "PERSON", "Alice")
+        by_chunk = {m.chunk_id: m for m in agg.mentions.values() if m.entity_id == eid}
+        assert by_chunk["ch-1"].name_as_extracted == "Alice"
+        assert by_chunk["ch-2"].name_as_extracted == "Alice"
+        # Per-chunk aliases live on the per-chunk Mention.
+        assert by_chunk["ch-1"].aliases == []
+        assert "Ms. Alice" in by_chunk["ch-2"].aliases
+
+    def test_mention_carries_chunks_description(self):
+        """Different chunks may describe the same entity differently — each
+        Mention keeps its own description, the Entity bootstraps from the
+        longest one as a stopgap until the synthesizer rewrites it."""
+        chunks = [
+            ("ch-a", [_ent("Bob", desc="short")], []),
+            ("ch-b", [_ent("Bob", desc="a noticeably longer description here")], []),
+        ]
+        agg = aggregate_document_extractions(chunks, "c1", VALID_TYPES, VALID_RELS)
+        eid = make_entity_id("c1", "PERSON", "Bob")
+        by_chunk = {m.chunk_id: m for m in agg.mentions.values() if m.entity_id == eid}
+        assert by_chunk["ch-a"].description == "short"
+        assert by_chunk["ch-b"].description == "a noticeably longer description here"
+        # Entity-level description bootstrap = longest seen during this run.
+        assert agg.entities[eid].description == (
+            "a noticeably longer description here"
+        )

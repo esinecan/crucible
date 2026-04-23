@@ -7,20 +7,76 @@ from neo4j.exceptions import ClientError
 
 from ..config import Config
 from ..extraction import sanitize_rel_type
-from ..models import Chunk, Corpus, Document, Entity, Insight, ReasoningNode, Relation
+from ..models import (
+    Chunk,
+    Corpus,
+    Document,
+    Entity,
+    Insight,
+    Mention,
+    ReasoningNode,
+    Relation,
+)
 from .schema import ensure_schema
 
 
 class CrucibleGraph:
     def __init__(self, config: Config):
-        self._driver = GraphDatabase.driver(
-            config.neo4j_uri, auth=(config.neo4j_user, config.neo4j_password)
-        )
+        # Two flavors of Neo4j notification spam to suppress:
+        #   - UNRECOGNIZED warnings: `MATCH (ch)-[:EXTRACTION_DONE]->` fires
+        #     before any EXTRACTION_DONE edge exists in a fresh graph. Zero
+        #     rows is the correct answer; the warning is misleading.
+        #   - INFORMATION-severity SCHEMA notes: every CREATE ... IF NOT
+        #     EXISTS in ensure_schema() emits one on second-and-later runs.
+        # Filter both at the driver. WARNING+ for real notifications still
+        # passes through (deprecations, performance hints).
+        driver_kwargs: dict = {
+            "auth": (config.neo4j_user, config.neo4j_password),
+        }
+        try:
+            self._driver = GraphDatabase.driver(
+                config.neo4j_uri,
+                notifications_disabled_classifications=["UNRECOGNIZED"],
+                notifications_min_severity="WARNING",
+                **driver_kwargs,
+            )
+        except TypeError:
+            # Older driver; parameter absent. Fall back to default behavior.
+            self._driver = GraphDatabase.driver(config.neo4j_uri, **driver_kwargs)
+
         with self._driver.session() as s:
             ensure_schema(s)
 
     def close(self):
         self._driver.close()
+
+    def resolve_corpus_id(self, ref: str) -> str:
+        """Look up a corpus by either its id or its name.
+
+        CLI commands historically required the hashed corpus_id; users
+        naturally typed the name and got zero-row responses. This helper
+        accepts either and returns the canonical id. Raises ValueError on
+        no match so callers don't silently extract against nothing.
+        """
+        if not ref:
+            raise ValueError("corpus reference is empty")
+        rows = self.cypher_read(
+            "MATCH (c:Corpus) WHERE c.id = $ref OR c.name = $ref "
+            "RETURN c.id AS id, c.name AS name LIMIT 2",
+            ref=ref,
+        )
+        if not rows:
+            raise ValueError(f"No corpus matches {ref!r} (tried id and name)")
+        if len(rows) > 1:
+            # Name collision with an id, or two corpora share a name. Prefer
+            # the id-match; if none matched as id, report ambiguity.
+            for r in rows:
+                if r["id"] == ref:
+                    return r["id"]
+            raise ValueError(
+                f"{ref!r} matches multiple corpora: {[r['name'] for r in rows]}"
+            )
+        return rows[0]["id"]
 
     # ── Corpus ──────────────────────────────────────────────
 
@@ -408,11 +464,12 @@ class CrucibleGraph:
     # ── Entity Extraction ──────────────────────────────────
 
     def upsert_entity(self, entity: Entity) -> None:
-        """Upsert an Entity, unioning source_chunks and aliases across calls.
+        """Upsert an Entity.
 
-        source_chunks is the authoritative mention trace — the mention_count
-        readings in queries derive from size(source_chunks). description still
-        uses 'longer wins' as a stopgap; async synthesis is the planned fix.
+        Entity holds canonical/synthesized state only — per-chunk provenance
+        lives on Mention nodes. Aliases still union on match because they're a
+        natural set-property; description uses 'longer wins' as a bootstrap
+        only, because the EntitySynthesizer will rewrite it on the next pass.
         """
         def _tx(tx):
             tx.run(
@@ -420,11 +477,10 @@ class CrucibleGraph:
                 "ON CREATE SET e.corpus_id=$cid, e.name=$name, "
                 "  e.entity_type=$etype, e.description=$desc, "
                 "  e.aliases=$aliases, e.embedding=$emb, "
-                "  e.source_chunks=$chunks, e.properties=$props, "
+                "  e.properties=$props, "
+                "  e.last_synthesized_at=$synced, "
                 "  e.created_at=$ts "
                 "ON MATCH SET "
-                "  e.source_chunks = e.source_chunks + "
-                "    [x IN $chunks WHERE NOT x IN e.source_chunks], "
                 "  e.aliases = e.aliases + "
                 "    [x IN $aliases WHERE NOT x IN e.aliases], "
                 "  e.description = CASE WHEN size(e.description) < size($desc) "
@@ -436,9 +492,56 @@ class CrucibleGraph:
                 desc=entity.description,
                 aliases=entity.aliases,
                 emb=entity.embedding or None,
-                chunks=entity.source_chunks,
                 props=json.dumps(entity.properties),
+                synced=entity.last_synthesized_at,
                 ts=entity.created_at,
+            )
+
+        with self._driver.session() as s:
+            s.execute_write(_tx)
+
+    def upsert_mention(self, mention: Mention) -> None:
+        """Upsert a Mention and its two structural edges in one transaction.
+
+        (Chunk)-[:EXTRACTS]->(Mention)-[:RESOLVES_TO]->(Entity)
+
+        Both endpoints must exist; raises if they don't (mirrors the
+        upsert_document parent-validation pattern). Idempotent because
+        Mention.id is derived from (chunk_id, entity_id).
+        """
+        def _tx(tx):
+            found = tx.run(
+                "MATCH (ch:Chunk {id: $cid}) "
+                "MATCH (e:Entity {id: $eid}) "
+                "RETURN ch.id AS c, e.id AS e",
+                cid=mention.chunk_id,
+                eid=mention.entity_id,
+            ).single()
+            if found is None:
+                raise ValueError(
+                    f"Mention endpoints missing: chunk={mention.chunk_id!r}, "
+                    f"entity={mention.entity_id!r}. Upsert both before mentions."
+                )
+            tx.run(
+                "MERGE (m:Mention {id: $id}) "
+                "ON CREATE SET m.chunk_id=$cid, m.entity_id=$eid, "
+                "  m.name_as_extracted=$nax, m.description=$desc, "
+                "  m.aliases=$aliases, m.confidence=$conf, "
+                "  m.properties=$props, m.created_at=$ts "
+                "WITH m "
+                "MATCH (ch:Chunk {id: $cid}) "
+                "MATCH (e:Entity {id: $eid}) "
+                "MERGE (ch)-[:EXTRACTS]->(m) "
+                "MERGE (m)-[:RESOLVES_TO]->(e)",
+                id=mention.id,
+                cid=mention.chunk_id,
+                eid=mention.entity_id,
+                nax=mention.name_as_extracted,
+                desc=mention.description,
+                aliases=mention.aliases,
+                conf=mention.confidence,
+                props=json.dumps(mention.properties),
+                ts=mention.created_at,
             )
 
         with self._driver.session() as s:
@@ -483,16 +586,8 @@ class CrucibleGraph:
         with self._driver.session() as s:
             s.execute_write(_tx)
 
-    def link_entity_to_chunk(self, entity_id: str, chunk_id: str) -> None:
-        with self._driver.session() as s:
-            s.run(
-                "MATCH (e:Entity {id: $eid}), (ch:Chunk {id: $cid}) "
-                "MERGE (e)-[:MENTIONED_IN]->(ch)",
-                eid=entity_id,
-                cid=chunk_id,
-            )
-
     def entity_search(self, query: str, limit: int = 10) -> list[dict]:
+        """Fulltext search over entities, returning mention_count via Mention count."""
         with self._driver.session() as s:
             return [
                 dict(r)
@@ -502,7 +597,7 @@ class CrucibleGraph:
                     "RETURN node.id AS id, node.name AS name, "
                     "node.entity_type AS entity_type, "
                     "node.description AS description, "
-                    "size(node.source_chunks) AS mention_count, score "
+                    "size((node)<-[:RESOLVES_TO]-(:Mention)) AS mention_count, score "
                     "ORDER BY score DESC LIMIT $lim",
                     q=query,
                     lim=limit,
@@ -531,8 +626,9 @@ class CrucibleGraph:
             return [
                 dict(r)
                 for r in s.run(
-                    "MATCH (e:Entity)-[:MENTIONED_IN]->(ch:Chunk {id: $cid}) "
-                    "RETURN e.id AS id, e.name AS name, "
+                    "MATCH (ch:Chunk {id: $cid})-[:EXTRACTS]->(:Mention)"
+                    "-[:RESOLVES_TO]->(e:Entity) "
+                    "RETURN DISTINCT e.id AS id, e.name AS name, "
                     "e.entity_type AS entity_type, "
                     "e.description AS description",
                     cid=chunk_id,
@@ -540,15 +636,20 @@ class CrucibleGraph:
             ]
 
     def get_chunks_for_entity(self, entity_id: str) -> list[dict]:
+        """Chunks that mention an entity, via Mention. DISTINCT because id
+        contract only guarantees one Mention per (chunk, entity) — keeping
+        DISTINCT protects against future duplicate edges. position projects
+        through so ORDER BY can sort within document path."""
         with self._driver.session() as s:
             return [
                 dict(r)
                 for r in s.run(
-                    "MATCH (e:Entity {id: $eid})-[:MENTIONED_IN]->(ch:Chunk)"
-                    "-[:PART_OF]->(d:Document) "
-                    "RETURN ch.id AS id, ch.text AS text, "
+                    "MATCH (e:Entity {id: $eid})<-[:RESOLVES_TO]-(:Mention)"
+                    "<-[:EXTRACTS]-(ch:Chunk)-[:PART_OF]->(d:Document) "
+                    "RETURN DISTINCT ch.id AS id, ch.text AS text, "
+                    "ch.position AS position, "
                     "d.path AS doc_path, d.title AS doc_title "
-                    "ORDER BY d.path, ch.position",
+                    "ORDER BY doc_path, position",
                     eid=entity_id,
                 )
             ]
@@ -611,6 +712,67 @@ class CrucibleGraph:
         with self._driver.session() as s:
             return [dict(r) for r in s.run(q, cid=corpus_id)]
 
+    def get_dirty_entities(self, corpus_id: str, limit: int = 0) -> list[dict]:
+        """Entities with newer Mentions than their last synthesis pass.
+
+        Dirty rule: any Mention whose `created_at` is newer than the entity's
+        `last_synthesized_at`, OR `last_synthesized_at` is empty/null. The
+        synthesizer reads this list and walks Mentions to rebuild the
+        canonical description.
+        """
+        q = (
+            "MATCH (e:Entity {corpus_id: $cid}) "
+            "OPTIONAL MATCH (e)<-[:RESOLVES_TO]-(m:Mention) "
+            "WITH e, max(m.created_at) AS last_mention "
+            "WHERE last_mention IS NOT NULL "
+            "  AND (e.last_synthesized_at IS NULL "
+            "       OR e.last_synthesized_at = '' "
+            "       OR last_mention > e.last_synthesized_at) "
+            "RETURN e.id AS id, e.name AS name, e.entity_type AS entity_type "
+            "ORDER BY e.id"
+        )
+        if limit and limit > 0:
+            q += " LIMIT $n"
+        with self._driver.session() as s:
+            return [dict(r) for r in s.run(q, cid=corpus_id, n=limit)]
+
+    def get_mentions_for_entity(self, entity_id: str) -> list[dict]:
+        """All Mentions resolving to one entity, with their per-chunk surface
+        forms, descriptions, and aliases. Sorted by chunk_id for determinism."""
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (e:Entity {id: $eid})<-[:RESOLVES_TO]-(m:Mention) "
+                    "RETURN m.id AS id, m.chunk_id AS chunk_id, "
+                    "m.name_as_extracted AS name_as_extracted, "
+                    "m.description AS description, m.aliases AS aliases, "
+                    "m.confidence AS confidence "
+                    "ORDER BY m.chunk_id",
+                    eid=entity_id,
+                )
+            ]
+
+    def update_entity_synthesis(
+        self,
+        entity_id: str,
+        description: str,
+        aliases: list[str],
+        synthesized_at: str,
+    ) -> None:
+        """Apply a synthesized description and alias set to an Entity."""
+        with self._driver.session() as s:
+            s.run(
+                "MATCH (e:Entity {id: $eid}) "
+                "SET e.description = $desc, "
+                "    e.aliases = $aliases, "
+                "    e.last_synthesized_at = $synced",
+                eid=entity_id,
+                desc=description,
+                aliases=aliases,
+                synced=synthesized_at,
+            )
+
     def get_unembedded_entities(self, corpus_id: str) -> list[dict]:
         """Get entities without embeddings."""
         with self._driver.session() as s:
@@ -648,8 +810,9 @@ class CrucibleGraph:
         with self._driver.session() as s:
             r = s.run(
                 "OPTIONAL MATCH (e:Entity) WITH count(e) AS entities "
+                # Entity-Entity relations only; Mention provenance edges sit
+                # between Chunk and Entity and are not counted here.
                 "OPTIONAL MATCH (:Entity)-[r]->(:Entity) "
-                "WHERE type(r) <> 'MENTIONED_IN' "
                 "WITH entities, count(r) AS relations "
                 "RETURN entities, relations"
             ).single()

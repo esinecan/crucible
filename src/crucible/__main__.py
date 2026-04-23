@@ -59,6 +59,14 @@ def main():
     rate_cmd.add_argument("insight_id", help="Insight ID")
     rate_cmd.add_argument("score", type=float, help="Score 0.0-1.0")
 
+    syn = sub.add_parser(
+        "synthesize-entities",
+        help="LLM-merge per-chunk Mentions into canonical Entity descriptions",
+    )
+    syn.add_argument("--corpus", required=True, help="Corpus ID")
+    syn.add_argument("--limit", type=int, default=0, help="Max entities to consider (0=all dirty)")
+    syn.add_argument("--max-calls", type=int, default=0, help="Override max LLM calls (0=config default)")
+
     sub.add_parser("stats", help="Show graph statistics")
     sub.add_parser("serve", help="Start MCP server")
 
@@ -157,6 +165,7 @@ def main():
         logging.basicConfig(level=logging.INFO, format="%(message)s")
         config = Config()
         g = CrucibleGraph(config)
+        args.corpus = g.resolve_corpus_id(args.corpus)
 
         if args.batch_api:
             from .embeddings import batch_embed_via_api
@@ -261,6 +270,7 @@ def main():
 
         config = Config()
         g = CrucibleGraph(config)
+        args.corpus = g.resolve_corpus_id(args.corpus)
         gen = OntologyGenerator(config, g)
         ontology = gen.generate(args.corpus)
         print(f"Generated ontology: {len(ontology.classes)} classes, {len(ontology.relations)} relations\n")
@@ -286,6 +296,7 @@ def main():
 
         config = Config()
         g = CrucibleGraph(config)
+        args.corpus = g.resolve_corpus_id(args.corpus)
 
         if args.ontology:
             ontology = Ontology.from_json(Path(args.ontology).read_text())
@@ -332,6 +343,30 @@ def main():
                 print(f"  {a:14s}  mean={p['mean']:.3f}  α={p['alpha']:.0f} β={p['beta']:.0f}  obs={p['observations']:.0f}")
         else:
             print(f"Insight not found: {args.insight_id}")
+        g.close()
+
+    elif args.command == "synthesize-entities":
+        import logging
+
+        from .config import Config
+        from .extraction.synthesize import EntitySynthesizer
+        from .graph.client import CrucibleGraph
+
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        config = Config()
+        g = CrucibleGraph(config)
+        args.corpus = g.resolve_corpus_id(args.corpus)
+        synth = EntitySynthesizer(config, g)
+        max_calls = args.max_calls if args.max_calls else None
+        stats = synth.synthesize_dirty(
+            args.corpus, limit=args.limit, max_calls=max_calls,
+        )
+        print(f"Dirty entities found:  {stats['dirty_total']}")
+        print(f"Synthesized:           {stats['synthesized']}")
+        print(f"Re-embedded:           {stats['embedded']}")
+        print(f"Errors:                {stats['errors']}")
+        if stats["remaining"]:
+            print(f"Remaining (budget hit): {stats['remaining']}")
         g.close()
 
     elif args.command == "stats":

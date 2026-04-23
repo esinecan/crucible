@@ -299,3 +299,26 @@ class TestStats:
         assert s["chunks"] == 1
         assert s["insights_l1"] == 0
         assert s["insights_l2"] == 0
+
+
+class TestResolveCorpusId:
+    """The CLI used to require the hashed corpus_id; users naturally typed
+    the human name and silently extracted zero chunks. resolve_corpus_id
+    accepts either, and raises on miss so failures are loud."""
+
+    def test_resolves_by_id(self, graph):
+        graph.upsert_corpus(_make_corpus(cid="abc123", name="my-corpus"))
+        assert graph.resolve_corpus_id("abc123") == "abc123"
+
+    def test_resolves_by_name(self, graph):
+        graph.upsert_corpus(_make_corpus(cid="abc123", name="my-corpus"))
+        assert graph.resolve_corpus_id("my-corpus") == "abc123"
+
+    def test_raises_on_no_match(self, graph):
+        graph.upsert_corpus(_make_corpus(cid="abc123", name="my-corpus"))
+        with pytest.raises(ValueError, match="No corpus matches"):
+            graph.resolve_corpus_id("nope")
+
+    def test_empty_ref_raises(self, graph):
+        with pytest.raises(ValueError, match="empty"):
+            graph.resolve_corpus_id("")

@@ -3,20 +3,16 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import random
-import re
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 from pathlib import Path
 
-import httpx
-
 from ..config import Config
 from ..embeddings import embed_batch, embed_text
 from ..graph.client import CrucibleGraph
+from ..llm_client import LLMClient, parse_json_lenient
 from ..models import Insight
 from .evaluator import AdversarialEvaluator, EvalContext, EvalResult
 
@@ -102,38 +98,36 @@ def _doc_distance(path_a: str, path_b: str) -> float:
     return 1.0 - (shared / total) if total > 0 else 0.0
 
 
-def _parse_json_lenient(text: str) -> dict | list | None:
-    """Parse JSON from LLM output, tolerant of markdown fences and preamble."""
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try extracting from markdown code block
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Try finding JSON object or array
-    for pattern in [r"\{[\s\S]*\}", r"\[[\s\S]*\]"]:
-        m = re.search(pattern, text)
-        if m:
-            try:
-                return json.loads(m.group())
-            except json.JSONDecodeError:
-                pass
-    return None
-
-
 # ── Thompson Sampler ────────────────────────────────────────
 
 class ThompsonBandit:
-    """Beta-Bernoulli Thompson Sampling over strategy arms."""
+    """Beta posterior over strategy arms.
 
-    def __init__(self, arms: list[str]):
+    Two update modes:
+    - "pseudo_count" (default): alpha += score, beta += (1-score). Deterministic
+      across replays of the same log. Same posterior mean as bernoulli in
+      expectation, lower per-observation variance.
+    - "bernoulli": flip random.random() < score and bump one side by 1. The
+      historical mode; per-process state of `random` makes log replay
+      non-deterministic across boots.
+
+    If snapshot_path is set, every update persists (alpha, beta) to disk and
+    load_snapshot() restores it on init — the JSONL reward log becomes audit
+    trail rather than state.
+    """
+
+    SNAPSHOT_VERSION = 1
+
+    def __init__(
+        self,
+        arms: list[str],
+        update_mode: str = "pseudo_count",
+        snapshot_path: str | Path | None = None,
+    ):
         self.alpha: dict[str, float] = {a: 1.0 for a in arms}
         self.beta: dict[str, float] = {a: 1.0 for a in arms}
+        self._update_mode = update_mode
+        self._snapshot_path = Path(snapshot_path) if snapshot_path else None
 
     def select(self) -> str:
         samples = {
@@ -142,11 +136,20 @@ class ThompsonBandit:
         }
         return max(samples, key=samples.get)
 
-    def update(self, arm: str, score: float) -> None:
-        if random.random() < score:
-            self.alpha[arm] += 1
-        else:
-            self.beta[arm] += 1
+    def update(self, arm: str, score: float, persist: bool = True) -> None:
+        if arm not in self.alpha:
+            return
+        if self._update_mode == "bernoulli":
+            if random.random() < score:
+                self.alpha[arm] += 1
+            else:
+                self.beta[arm] += 1
+        else:  # pseudo_count
+            s = max(0.0, min(1.0, float(score)))
+            self.alpha[arm] += s
+            self.beta[arm] += (1.0 - s)
+        if persist:
+            self._write_snapshot()
 
     def load_from_log(self, path: Path) -> None:
         if not path.exists():
@@ -154,11 +157,55 @@ class ThompsonBandit:
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
-            entry = json.loads(line)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
             arm = entry.get("strategy", "")
             arm_name = arm.replace("_discovery", "").replace("_detection", "")
             if arm_name in self.alpha:
-                self.update(arm_name, entry.get("score", 0.5))
+                # persist=False: avoid N snapshot writes during replay; one
+                # write happens at the end via _write_snapshot below.
+                self.update(arm_name, entry.get("score", 0.5), persist=False)
+        self._write_snapshot()
+
+    def load_snapshot(self) -> bool:
+        """Restore (alpha, beta) from snapshot. Returns True if loaded.
+
+        Falls back to False (caller should replay log) if snapshot is missing,
+        unreadable, or wrong schema version.
+        """
+        if not self._snapshot_path or not self._snapshot_path.exists():
+            return False
+        try:
+            data = json.loads(self._snapshot_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return False
+        if data.get("version") != self.SNAPSHOT_VERSION:
+            return False
+        alpha = data.get("alpha", {})
+        beta = data.get("beta", {})
+        for arm in self.alpha:
+            if arm in alpha and arm in beta:
+                self.alpha[arm] = float(alpha[arm])
+                self.beta[arm] = float(beta[arm])
+        return True
+
+    def _write_snapshot(self) -> None:
+        if not self._snapshot_path:
+            return
+        try:
+            self._snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": self.SNAPSHOT_VERSION,
+                "update_mode": self._update_mode,
+                "alpha": dict(self.alpha),
+                "beta": dict(self.beta),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._snapshot_path.write_text(json.dumps(data, indent=2))
+        except OSError:
+            pass  # snapshot is best-effort
 
     def posteriors(self) -> dict[str, dict]:
         return {
@@ -187,32 +234,20 @@ class InsightEngine:
         self.graph = graph
         self.reward_log = Path(reward_log) if reward_log else Path("insight_rewards.jsonl")
         self.noise_patterns = noise_patterns if noise_patterns is not None else DEFAULT_NOISE_PATTERNS
-        self.bandit = ThompsonBandit(STRATEGIES)
-        self.bandit.load_from_log(self.reward_log)
+        self._llm_client = LLMClient(config)
+        self.bandit = ThompsonBandit(
+            STRATEGIES,
+            update_mode=getattr(config, "bandit_update_mode", "pseudo_count"),
+            snapshot_path=self.reward_log.with_suffix(".snapshot.json"),
+        )
+        # Snapshot first; only fall back to log replay on cold start (or
+        # corrupted snapshot). Once load_from_log finishes it writes a
+        # snapshot, so subsequent boots short-circuit.
+        if not self.bandit.load_snapshot():
+            self.bandit.load_from_log(self.reward_log)
         self.evaluator = AdversarialEvaluator(config) if use_evaluator else None
 
-    # ── Shared LLM Client ──────────────────────────────────
-
-    def _llm(self, system: str, user: str, max_tokens: int = 400) -> str:
-        api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
-        resp = httpx.post(
-            f"{base_url}/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.7,
-                "max_tokens": max_tokens,
-            },
-            timeout=30.0,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+    # ── Sample Helpers ─────────────────────────────────────
 
     def _get_samples(
         self, corpus_id: str | None, raw_count: int, final_count: int
@@ -229,9 +264,10 @@ class InsightEngine:
 
     def _synthesize(self, insight: Insight) -> str:
         """Replace template insight text with LLM-generated explanation."""
-        resp = self._llm(
+        resp = self._llm_client.chat(
             _synthesize_system(self.config.domain_preamble),
             f"Raw insight data:\n\n{insight.text}",
+            temperature=0.7,
             max_tokens=250,
         )
         return f"[{insight.strategy}] {resp}\n\n---\n{insight.text}"
@@ -368,19 +404,26 @@ class InsightEngine:
     def _entity_bridge_candidates(
         self, corpus_id: str | None
     ) -> list[tuple[float, dict, dict, str]]:
-        """Find cross-document bridges via shared entities."""
+        """Find cross-document bridges via shared entities.
+
+        Walks Chunk ←EXTRACTS─ Mention ─RESOLVES_TO→ Entity on both sides of
+        the pair. Entity mention_count is derived from the Mention degree
+        rather than a stored list.
+        """
         with self.graph._driver.session() as s:
             rows = [
                 dict(r)
                 for r in s.run(
-                    "MATCH (c1:Chunk)<-[:MENTIONED_IN]-(e:Entity)-[:MENTIONED_IN]->(c2:Chunk) "
+                    "MATCH (c1:Chunk)-[:EXTRACTS]->(:Mention)-[:RESOLVES_TO]->"
+                    "(e:Entity)<-[:RESOLVES_TO]-(:Mention)<-[:EXTRACTS]-(c2:Chunk) "
                     "MATCH (c1)-[:PART_OF]->(d1:Document), (c2)-[:PART_OF]->(d2:Document) "
                     "WHERE d1 <> d2 AND c1.id < c2.id "
                     "WITH e, c1, c2, d1, d2, rand() AS r "
                     "ORDER BY r LIMIT 50 "
                     "RETURN e.name AS entity, c1.id AS c1_id, c1.text AS c1_text, "
                     "d1.path AS d1_path, c2.id AS c2_id, c2.text AS c2_text, "
-                    "d2.path AS d2_path, size(e.source_chunks) AS mc"
+                    "d2.path AS d2_path, "
+                    "size((e)<-[:RESOLVES_TO]-(:Mention)) AS mc"
                 )
             ]
 
@@ -562,12 +605,15 @@ class InsightEngine:
     def _entity_hub_candidates(
         self, corpus_id: str | None
     ) -> list[tuple[float, str, str, int, list[str], str, str]]:
-        """Find hub entities that span many documents."""
+        """Find hub entities that span many documents. Traverses the Mention
+        hop — doc_count counts distinct documents whose chunks extracted a
+        Mention resolving to this entity."""
         with self.graph._driver.session() as s:
             rows = [
                 dict(r)
                 for r in s.run(
-                    "MATCH (e:Entity)-[:MENTIONED_IN]->(ch:Chunk)-[:PART_OF]->(d:Document) "
+                    "MATCH (e:Entity)<-[:RESOLVES_TO]-(:Mention)"
+                    "<-[:EXTRACTS]-(ch:Chunk)-[:PART_OF]->(d:Document) "
                     "WITH e, count(DISTINCT d) AS doc_count, "
                     "collect(DISTINCT d.path) AS docs, "
                     "collect(ch.id)[0] AS sample_chunk_id, "
@@ -727,13 +773,14 @@ class InsightEngine:
                 continue
 
             try:
-                resp = self._llm(
+                resp = self._llm_client.chat(
                     _contradiction_system(self.config.domain_preamble),
                     f"Passage A (from {a.get('doc_path', '?')}):\n{a['text'][:600]}\n\n"
                     f"Passage B (from {b.get('doc_path', '?')}):\n{b['text'][:600]}",
+                    temperature=0.7,
                     max_tokens=200,
                 )
-                parsed = _parse_json_lenient(resp)
+                parsed = parse_json_lenient(resp)
                 if not parsed or not isinstance(parsed, dict):
                     continue
                 if not parsed.get("contradiction", False):
@@ -776,12 +823,18 @@ class InsightEngine:
     def _entity_contradiction_candidates(
         self, corpus_id: str | None
     ) -> list[tuple[float, dict, dict, str]]:
-        """Find cross-doc chunk pairs that share an entity — contradiction candidates."""
+        """Find cross-doc chunk pairs that share an entity — contradiction candidates.
+
+        Same bi-directional Mention walk as the bridge query. Shared entity
+        across different documents is the pre-filter; LLM decides whether
+        the claims are actually contradictory.
+        """
         with self.graph._driver.session() as s:
             rows = [
                 dict(r)
                 for r in s.run(
-                    "MATCH (c1:Chunk)<-[:MENTIONED_IN]-(e:Entity)-[:MENTIONED_IN]->(c2:Chunk) "
+                    "MATCH (c1:Chunk)-[:EXTRACTS]->(:Mention)-[:RESOLVES_TO]->"
+                    "(e:Entity)<-[:RESOLVES_TO]-(:Mention)<-[:EXTRACTS]-(c2:Chunk) "
                     "MATCH (c1)-[:PART_OF]->(d1:Document), (c2)-[:PART_OF]->(d2:Document) "
                     "WHERE d1 <> d2 AND c1.id < c2.id "
                     "WITH e, c1, c2, d1, d2, rand() AS r "
@@ -812,8 +865,7 @@ class InsightEngine:
 
         Two channels:
         1. Entity graph: entities with many incoming relations but few
-           MENTIONED_IN edges = referenced by others but poorly covered.
-           Zero LLM cost.
+           Mentions = referenced by others but poorly covered. Zero LLM cost.
         2. LLM: samples chunks, asks what's assumed but missing.
            One LLM call per cycle.
         """
@@ -859,12 +911,13 @@ class InsightEngine:
                     f"[{s['doc_path']}]\n{s['text'][:300]}" for s in samples
                 )
                 try:
-                    resp = self._llm(
+                    resp = self._llm_client.chat(
                         _gap_system(self.config.domain_preamble),
                         f"Knowledge base sample:\n\n{sample_text}",
+                        temperature=0.7,
                         max_tokens=500,
                     )
-                    parsed = _parse_json_lenient(resp)
+                    parsed = parse_json_lenient(resp)
                     if parsed and isinstance(parsed, list):
                         for item in parsed[:remaining]:
                             if not isinstance(item, dict):
@@ -900,17 +953,24 @@ class InsightEngine:
     def _entity_gap_candidates(
         self, corpus_id: str | None
     ) -> list[tuple[float, str, str, int, int]]:
-        """Find entities that are referenced by others but have sparse direct coverage."""
+        """Find entities that are referenced by others but have sparse direct coverage.
+
+        `incoming` counts entity-entity relations pointing at this entity;
+        `mentions` counts distinct chunks whose Mentions resolve to it.
+        When incoming > mentions, the entity is talked ABOUT without being
+        covered directly — classic knowledge gap.
+        """
         with self.graph._driver.session() as s:
             rows = [
                 dict(r)
                 for r in s.run(
+                    # Mention is not an Entity-Entity relation, so this walk
+                    # only counts real typed relations between entities.
                     "MATCH (e:Entity)<-[r]-(other:Entity) "
-                    "WHERE type(r) <> 'MENTIONED_IN' "
                     "WITH e, count(r) AS incoming "
                     "WHERE incoming >= 2 "
-                    "OPTIONAL MATCH (e)-[:MENTIONED_IN]->(ch:Chunk) "
-                    "WITH e, incoming, count(ch) AS mentions "
+                    "OPTIONAL MATCH (e)<-[:RESOLVES_TO]-(:Mention)<-[:EXTRACTS]-(ch:Chunk) "
+                    "WITH e, incoming, count(DISTINCT ch) AS mentions "
                     "WHERE mentions < incoming "
                     "RETURN e.name AS name, e.entity_type AS type, "
                     "incoming, mentions "

@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 
-import httpx
-
 from ..config import Config
+from ..llm_client import LLMClient
 
 # ── Prompt Builders (domain injected at runtime) ────────────
 
@@ -70,10 +68,9 @@ class EvalResult:
 
 class AdversarialEvaluator:
     def __init__(self, config: Config):
-        self.api_key = os.getenv("DEEPSEEK_API_KEY", "")
-        self.base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-        self.model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
+        self.config = config
         self.domain = config.domain_preamble
+        self._llm_client = LLMClient(config)
 
     def evaluate(self, insight_text: str, context: EvalContext | None = None) -> EvalResult:
         user_msg = f"Evaluate this insight:\n\n{insight_text}"
@@ -108,25 +105,9 @@ class AdversarialEvaluator:
         )
 
     def _chat(self, system: str, user: str) -> str:
-        resp = httpx.post(
-            f"{self.base_url}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "temperature": 0.7,
-                "max_tokens": 400,
-            },
-            timeout=30.0,
+        return self._llm_client.chat(
+            system, user, temperature=0.7, max_tokens=400,
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
 
     def _parse_scores(self, text: str) -> dict[str, float]:
         """Extract scores from referee response, tolerant of messy output."""

@@ -56,11 +56,17 @@ def fake_embed(monkeypatch):
 
     monkeypatch.setattr(embeddings, "embed_batch", _embed_batch)
     monkeypatch.setattr(embeddings, "embed_text", _embed_text)
-    # Also patch in modules that imported at module-load
+    # Also patch in modules that imported at module-load — Python caches the
+    # name binding at import time so patching the source module isn't enough.
     from crucible.ingestion import pipeline as _pipeline
     from crucible.reasoning import actions as _actions
+    from crucible.extraction import extractor as _extractor
+    from crucible.insight import engine as _engine
     monkeypatch.setattr(_pipeline, "embed_batch", _embed_batch, raising=False)
     monkeypatch.setattr(_actions, "embed_text", _embed_text, raising=False)
+    monkeypatch.setattr(_extractor, "embed_batch", _embed_batch, raising=False)
+    monkeypatch.setattr(_engine, "embed_batch", _embed_batch, raising=False)
+    monkeypatch.setattr(_engine, "embed_text", _embed_text, raising=False)
 
 
 # ── Neo4j via testcontainers (session-scoped) ───────────────
