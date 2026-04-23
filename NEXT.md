@@ -60,3 +60,21 @@ Bernoulli updates, same as insight bandit. Weight overlay for feedback-driven tr
 - Weight overlay for feedback-driven traversal must be isolated from base graph (prevents bias amplification)
 - "Motivate complexity from observed failure, not theory" -- don't add architecture until you see it fail
 - Yepis is heterogeneous (essays + transcripts + social + memories) -- Thompson may over-converge. Hub at 0.742 with 351 observations may be feedback-amplified
+
+## The structural ceiling (2026-04-23)
+
+After Phases 0/1/2 landed and the system was run against its own source as a test corpus, one observation kept coming back:
+
+**Crucible's most important feature is its least used one.**
+
+Every reward signal that drives the bandit ultimately resolves to a single referee score. The bandit math is airtight; the feedback loop from answers back to insights is clean. But the referee is an LLM (Advocate/Skeptic/Referee debate) with the same biases as the corpus the model is judging. Skeptic's recurring "merely restates the obvious" pattern flattens 95% of insight scores into the 0.5–0.85 band — too narrow to separate strategies cleanly. The 0.733→0.800→0.733 progression above is not signal noise from the search algorithm; it is the dynamic range of the referee.
+
+The system has exactly one mechanism that breaks the circular trust: `apply_human_feedback` (engine.py) and the `rate` CLI / `rate_insight` MCP tool, weighted **3×** in the bandit. After 640 bandit observations, that mechanism has been called **twice**. The epistemic bootstrap is built but unplugged.
+
+The deeper observation: **crucible is an epistemic system that outsources its own epistemology.** It trusts an LLM to tell it what's worth knowing. Phases 0.3 (pseudo-count determinism), 1 (Mention/Entity split), and 2 (synthesizer) all materially improved the engineering. None of them moved the referee. They never could; that is a different layer, and it is the layer that decides which strategy gets explored next.
+
+Two structural responses live in the cortex task `b174f847` plan:
+- **Phase 6.4** — symbolic referee adapter (e.g. burokrat's `evaluate_provision`) plugged into HybridReferee, so a domain that has crisp predicates can short-circuit the LLM judgment.
+- **Phase 6.1** — principle/lens strategy that pre-abstracts transferable principles, so the referee scores an abstracted concept rather than a raw chunk and the dynamic range can stretch.
+
+But the *zero-engineering* response is to put `crucible rate <insight_id> <score>` in front of users on every cycle. Either as a CLI prompt at the end of `explore`, or as an MCP-driven UI that surfaces the top N insights for human triage. The system already supports it. Until that loop is closed, every refactor in the codebase is being measured against the system's own prior.

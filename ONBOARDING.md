@@ -4,11 +4,12 @@ This doc is for Eren picking up Crucible in a new session. It covers what the sy
 
 ## What Crucible Is
 
-A knowledge graph engine with two modes:
-- **Insight mode**: discovers patterns in your corpus using a Thompson Sampling bandit
-- **Answer mode**: reasons toward answers using MCTS tree search
+A knowledge graph engine with three modes:
+- **Insight mode** — discovers patterns in your corpus using a Thompson Sampling bandit over six strategies (bridge, outlier, hub, meta, contradiction, gap).
+- **Extraction mode** — generates an ontology from those insights, then extracts typed entities + relations from chunks. Per-chunk Mentions sit between Chunks and Entities; an async synthesizer merges Mentions into canonical Entity descriptions.
+- **Answer mode** — reasons toward answers via MCTS over five expansion actions (search, follow_ref, challenge, synthesize, entity_walk).
 
-Both share a Neo4j graph and reinforce each other through a feedback loop.
+All three share a Neo4j graph. Insight discoveries feed extraction (ontology); extraction enriches insight strategies (entity-aware bridge/hub/contradiction/gap channels) and answer evidence (entity_walk action). Answer scores feed back to the insight bandit.
 
 ## How It Works (Plain English)
 
@@ -81,14 +82,26 @@ export CRUCIBLE_DOMAIN="Turkish political commentary knowledge base."
 # Check stats
 .venv/bin/python -m crucible stats
 
-# Run insight discovery (5 cycles, adversarial eval)
-.venv/bin/python -m crucible explore --cycles 5 --eval
+# Run insight discovery (5 cycles, adversarial eval is on by default)
+.venv/bin/python -m crucible explore --cycles 5
+
+# Generate an ontology from the discovered insights
+.venv/bin/python -m crucible ontology --corpus my-kb --output my-ontology.json
+
+# Extract typed entities + relations from chunks
+.venv/bin/python -m crucible extract --corpus my-kb --ontology my-ontology.json --workers 10
+
+# Synthesize canonical entity descriptions from per-chunk Mentions
+.venv/bin/python -m crucible synthesize-entities --corpus my-kb
 
 # Answer a question (10 iterations, depth 4)
 .venv/bin/python -m crucible answer "your question here" --iterations 10 --depth 4
 
-# Answer with feedback to insight bandit
+# Answer with feedback to insight bandit (3x boost for evidence insights from a high-scoring answer)
 .venv/bin/python -m crucible answer "question" --iterations 10 --feedback
+
+# Apply human feedback to an insight (3x weighted bandit signal — strongest available)
+.venv/bin/python -m crucible rate <insight_id> 0.9
 
 # Check bandit posteriors
 .venv/bin/python -m crucible bandit
@@ -97,21 +110,37 @@ export CRUCIBLE_DOMAIN="Turkish political commentary knowledge base."
 .venv/bin/python -m crucible serve
 ```
 
+**Resetting entity state for a corpus (e.g. after schema changes or for a clean re-extract):**
+
+```cypher
+MATCH (e:Entity {corpus_id: $cid}) DETACH DELETE e;
+MATCH (m:Mention) WHERE NOT (m)-[:RESOLVES_TO]->(:Entity) DETACH DELETE m;
+MATCH (ch:Chunk)-[r:EXTRACTION_DONE]->(:Corpus {id: $cid}) DELETE r;
+```
+
+Then re-run `crucible extract --corpus <name>`.
+
 ## File Map
 
 ```
 src/crucible/
-├── config.py           — All settings: neo4j, deepseek, MCTS params, domain
-├── models.py           — Corpus, Document, Chunk, Insight, ReasoningNode
+├── config.py           — All settings: neo4j, deepseek/gemini keys, MCTS params,
+│                         domain, bandit_update_mode, max_synthesis_calls
+├── models.py           — Corpus, Document, Chunk, Insight, Mention, Entity, Relation, ReasoningNode
 ├── embeddings.py       — Gemini embedding client (sync batch + Batch API)
-├── server.py           — MCP server: 7 tools (search, fulltext, cypher, stats,
-│                         get_insights, answer, reasoning_trees)
-├── __main__.py         — CLI: ingest, explore, answer, stats, bandit, serve
+├── llm_client.py       — Unified DeepSeek client (chat, chat_json, parse_json_lenient)
+├── server.py           — MCP server: 9 tools (search, fulltext, cypher, stats,
+│                         get_insights, answer, reasoning_trees, entity_search,
+│                         entity_graph, rate_insight)
+├── __main__.py         — CLI: ingest, explore, answer, stats, bandit, ontology,
+│                         extract, synthesize-entities, re-embed, embed-insights,
+│                         rate, serve
 │
 ├── graph/
 │   ├── schema.py       — Neo4j indexes + constraints (auto-applied on connect)
-│   └── client.py       — All Neo4j operations: CRUD, vector/fulltext search,
-│                         chunk/insight sampling, reasoning tree persistence
+│   └── client.py       — Neo4j operations: CRUD, vector/fulltext search,
+│                         chunk/insight sampling, reasoning tree persistence,
+│                         Mention upserts, corpus-name-or-id resolver
 │
 ├── ingestion/
 │   ├── pipeline.py     — Resumable directory ingestion with checkpoint
@@ -121,31 +150,46 @@ src/crucible/
 ├── insight/
 │   ├── engine.py       — Thompson Sampling bandit + 6 strategies + feedback loop
 │   │                     Strategies: bridge, outlier, hub, meta, contradiction, gap
+│   │                     Bandit snapshot (alpha,beta) on every update; pseudo-count default
 │   └── evaluator.py    — Advocate/Skeptic/Referee three-role debate
 │
-└── reasoning/
-    ├── mcts.py         — MCTS engine (UCT selection, backprop) + ActionBandit (UCB1)
-    │                     + ReasoningTree result object
-    ├── actions.py      — 4 expansion actions: search, follow_ref, challenge, synthesize
-    └── referee.py      — Pluggable referee: LLMReferee, SymbolicReferee, HybridReferee
+├── reasoning/
+│   ├── mcts.py         — MCTS engine (UCT selection, backprop) + ActionBandit (UCB1)
+│   │                     with snapshot persistence + ReasoningTree result object
+│   ├── actions.py      — 5 expansion actions: search, follow_ref, challenge,
+│   │                     synthesize, entity_walk
+│   └── referee.py      — Pluggable referee: LLMReferee (default), SymbolicReferee
+│                         (slot/NotImplementedError), HybridReferee
+│
+└── extraction/
+    ├── __init__.py     — sanitize_type_name, make_entity_id, make_relation_id, make_mention_id
+    ├── ontology.py     — OntologyGenerator: insights → typed class/relation schema
+    ├── aggregate.py    — In-memory doc-level aggregation: chunk-local +
+    │                     topological alias resolution; emits Entities + Mentions
+    ├── extractor.py    — EntityExtractor: per-chunk extraction with retry/transient
+    │                     classification, ThreadPoolExecutor parallelism
+    └── synthesize.py   — EntitySynthesizer: dirty-detection + LLM merge of
+                          Mentions → canonical Entity description, batched re-embed,
+                          cost cap via CRUCIBLE_MAX_SYNTHESIS_CALLS
 ```
 
 ## Where Work Left Off
 
-### Completed (Phase A)
-- MCTS core: UCT selection, expansion, simulation, backpropagation
-- Query-focused search (embeds the query, not partial answer)
-- Hybrid retrieval (vector + fulltext + insight search, merged by score)
-- Insight-aware evidence (insights as first-class evidence in MCTS)
-- UCB1 action bandit (learns which actions improve answer quality)
-- MCP server: `answer` and `reasoning_trees` tools
-- Feedback loop: answer scores reward contributing insights in the bandit
-- README and docstrings
+### Recently completed (2026-04-23 session)
+- **Phase 0.3 — Bandit determinism fix.** `pseudo_count` update mode (default) replaces Bernoulli coin-flip; (alpha, beta) snapshot persists to disk on every update so process boots are deterministic. Empirically validated: outlier posterior swung 0.27→0.73 across Bernoulli replays of insight_rewards.jsonl, now produces a single deterministic 0.539 with pseudo-count.
+- **Phase 0.1 — Unified LLMClient.** New `src/crucible/llm_client.py` modeled on burokrat's pattern; replaces 5 duplicate httpx-based call sites across engine.py, evaluator.py, actions.py, extractor.py, ontology.py. `chat_json` uses DeepSeek's `response_format={"type":"json_object"}` with lenient regex fallback.
+- **Phase 1 — Mention/Entity split.** New `Mention` node sitting between Chunk and Entity (`(Chunk)-[:EXTRACTS]->(Mention)-[:RESOLVES_TO]->(Entity)`). Entity.source_chunks dropped — provenance is Mention degree. Entity.last_synthesized_at added. Eight `MENTIONED_IN` query sites migrated to the new hop.
+- **Phase 2 — EntitySynthesizer.** New `extract/synthesize.py`. Detects dirty entities (any Mention newer than last_synthesized_at), LLM-merges Mentions into canonical description + alias union, re-embeds in batches, caps at `CRUCIBLE_MAX_SYNTHESIS_CALLS`.
+- **CLI UX**: `--corpus` accepts either name or hashed id (was previously silent-zero on name mismatch).
+- **Neo4j noise**: UNRECOGNIZED + INFORMATION-severity notifications filtered at driver init so `EXTRACTION_DONE` and "constraint already exists" don't flood logs.
 
-### Remaining (Phases B-D in Cortex task 678d080d)
-- **Phase B**: crucible.yaml config file (replace env vars)
-- **Phase C**: `crucible init` zero-friction setup + CLI polish
-- **Phase D**: auto-domain detection, auto-referee, auto-tune MCTS, graceful degradation
+Test suite: 167 unit + 30 integration = 197+ tests, all green. See git log for per-phase commits.
+
+### Still open (continuation plan in cortex task `b174f847`)
+- **Phase 0.2 — Referee benchmark.** Pivoted from Yepis hand-scoring to **crucible-on-crucible**: ingest src/ + docs as a corpus and verify answer quality against ground truth we directly know. Initial run validated the pipeline; full benchmark CLI not yet wired.
+- **Phase 4 — Observability cleanup.** Replace 12+ `except Exception: pass` sites with logged warnings. Audit the heuristic_discount=0.5 hardcoded in engine.py:1069.
+- **Phase 5 — Architectural cleanup.** Split engine.py (1158 lines) into per-strategy modules. `state_dir` config so reward/snapshot files don't litter CWD. Adopt burokrat's `session()` `@contextmanager` pattern to retire `graph._driver` external access.
+- **Phase 6 — Strategic.** Principle/lens strategy (NEXT.md's top fix). Multi-fire synthesize. Traversal bandit for `entity_walk`. Symbolic referee adapter (the only known referee that escapes the LLM-validates-LLM circular trust).
 
 ### Yepis POC Artifacts
 - Yepis graph: 104 docs, 4772 chunks, 76+ insights

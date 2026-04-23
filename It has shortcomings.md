@@ -1,3 +1,7 @@
+**Status: addressed (2026-04-23).** What this doc described as "essentially a vector store that happens to be in Neo4j" is no longer accurate. The extraction module (extraction/ontology.py + extraction/extractor.py + extraction/aggregate.py + extraction/synthesize.py) now materializes a typed entity graph alongside the chunk graph: ontology generation surfaces classes and relations from accumulated insights, the extractor produces per-chunk Mentions that resolve to canonical Entities, and the synthesizer LLM-merges those Mentions into coherent Entity descriptions. The four entity-channel insight strategies (bridge, hub, contradiction, gap) traverse this typed graph, and `EntityWalkAction` does the same for the MCTS answer flow. The original shortcoming-as-of-writing is below for historical context.
+
+---
+
 It has shortcomings. We need to properly leverage the knowledge graph aspects. Here's the lay of the land:
 
 **What the graph relationships actually are after `ingest`:**
