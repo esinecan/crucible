@@ -1,9 +1,29 @@
 from __future__ import annotations
 
 import json
+import re
 
 from neo4j import GraphDatabase
 from neo4j.exceptions import ClientError
+
+
+# Lucene query parser specials. Escaping is required for any user-supplied
+# text passed verbatim to db.index.fulltext.queryNodes — otherwise hyphens
+# parse as boolean NOT, parentheses open subqueries, etc. The set comes
+# from the Lucene QueryParser docs; '/' is included because Neo4j's
+# fulltext index uses Lucene 8+ which started flagging it as reserved.
+_LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
+
+
+def _escape_lucene(query: str) -> str:
+    """Backslash-escape Lucene query parser specials in user-supplied text.
+
+    Without this, a query like 'synthesize-entities --corpus' raises
+    ParseException because '-' is reserved as boolean NOT. Phrase-quoting
+    would also work but loses term-level matching; backslash escape keeps
+    the query as a bag of words.
+    """
+    return _LUCENE_SPECIAL.sub(r'\\\1', query)
 
 from ..config import Config
 from ..extraction import sanitize_rel_type
@@ -192,6 +212,9 @@ class CrucibleGraph:
             return [dict(r) for r in s.run(q, emb=embedding, k=limit, cid=corpus_id)]
 
     def fulltext_search(self, query: str, limit: int = 10) -> list[dict]:
+        """Lucene fulltext search over chunk text. Query is escaped for
+        Lucene parser specials so questions containing hyphens, colons,
+        slashes, parentheses, etc. don't raise ParseException."""
         with self._driver.session() as s:
             return [
                 dict(r)
@@ -202,7 +225,7 @@ class CrucibleGraph:
                     "RETURN node.id AS id, node.text AS text, node.heading AS heading, "
                     "d.path AS doc_path, score "
                     "ORDER BY score DESC LIMIT $lim",
-                    q=query,
+                    q=_escape_lucene(query),
                     lim=limit,
                 )
             ]
@@ -626,7 +649,7 @@ class CrucibleGraph:
                     "node.description AS description, "
                     "size((node)<-[:RESOLVES_TO]-(:Mention)) AS mention_count, score "
                     "ORDER BY score DESC LIMIT $lim",
-                    q=query,
+                    q=_escape_lucene(query),
                     lim=limit,
                 )
             ]

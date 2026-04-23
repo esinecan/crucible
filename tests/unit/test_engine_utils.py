@@ -11,6 +11,7 @@ import math
 
 import pytest
 
+from crucible.graph.client import _escape_lucene
 from crucible.insight.engine import (
     InsightEngine,
     _cosine,
@@ -213,3 +214,27 @@ class TestGapRowsFilter:
         out = InsightEngine._filter_gap_rows(rows)
         names = [r[1] for r in out]
         assert names == ["Alice", "orphan_y", "Bob"]
+
+
+class TestEscapeLucene:
+    """Lucene query parser specials must be escaped before being passed to
+    db.index.fulltext.queryNodes. Without this, a question like
+    'crucible synthesize-entities --corpus X' raises ParseException
+    because '-' is reserved for boolean NOT. T6a hit this on the first
+    real cross-module question — fix is here so the bug doesn't recur."""
+
+    def test_no_specials_passes_through(self):
+        assert _escape_lucene("plain words only") == "plain words only"
+
+    @pytest.mark.parametrize("char", list("+-&|!(){}[]^\"~*?:\\/"))
+    def test_each_special_escaped(self, char):
+        out = _escape_lucene(f"prefix {char} suffix")
+        assert f"\\{char}" in out
+
+    def test_realworld_question_does_not_explode(self):
+        q = "synthesize-entities --corpus X via graph/client.py:upsert"
+        escaped = _escape_lucene(q)
+        for special in ("-", "/", ":"):
+            assert f"\\{special}" in escaped
+        assert "synthesize" in escaped
+        assert "corpus" in escaped

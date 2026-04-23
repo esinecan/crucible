@@ -991,6 +991,23 @@ class InsightEngine:
             for score, name, etype, incoming, mentions in graph_gaps:
                 if len(insights) >= max_insights // 2:
                     break
+                # Fetch mention chunks so the grounding check (T4) has
+                # something to verify against. Without this, gap insights
+                # arrive with empty source_chunk_ids and grounding fails
+                # closed (verdict='unsupported', confidence=0.0) for every
+                # one of them — which marks the reward halved but never
+                # drops a real hallucination.
+                source_chunks: list[str] = []
+                try:
+                    rows = self.graph.cypher_read(
+                        "MATCH (e:Entity {name: $n, entity_type: $t})"
+                        "<-[:RESOLVES_TO]-(:Mention)<-[:EXTRACTS]-(ch:Chunk) "
+                        "RETURN ch.id AS id LIMIT 5",
+                        n=name, t=etype,
+                    )
+                    source_chunks = [r["id"] for r in rows if r.get("id")]
+                except Exception:
+                    pass
                 insight = Insight(
                     id=uuid.uuid4().hex[:20],
                     corpus_id=corpus_id or "",
@@ -1004,6 +1021,7 @@ class InsightEngine:
                     score=score,
                     novelty=score,
                     relevance=0.9,
+                    source_chunk_ids=source_chunks,
                     context={
                         "entity_name": name,
                         "entity_type": etype,
@@ -1051,6 +1069,13 @@ class InsightEngine:
                                 score=0.7,
                                 novelty=0.7,
                                 relevance=0.8,
+                                # The LLM saw all `samples` chunks; record the
+                                # ids so grounding can verify against any one
+                                # of them. Cap at 5 to bound the grounding's
+                                # chunk-fetch scope.
+                                source_chunk_ids=[
+                                    s["id"] for s in samples[:5]
+                                ],
                                 context={
                                     "topic": topic,
                                     "referenced_in": item.get("referenced_in", ""),
