@@ -242,6 +242,33 @@ class TestInsight:
         )
         assert rows == [{"i": "ins-1", "ch": "ch-1"}]
 
+    def test_existing_meta_bridge_pairs_returns_already_bridged(self, graph):
+        """existing_meta_bridge_pairs must return the (a_id, b_id) sorted
+        tuple for any L1 pair already linked by an L2 meta insight via
+        DERIVED_FROM. Used by _meta_cycle to skip already-bridged pairs and
+        avoid spending LLM cycles on redundant bridges."""
+        graph.upsert_corpus(_make_corpus())
+        l1_a = Insight(id="l1a", corpus_id="corp-1", text="a", strategy="hub",
+                       score=0.8, layer=1, embedding=_fake_vec(1))
+        l1_b = Insight(id="l1b", corpus_id="corp-1", text="b", strategy="gap",
+                       score=0.7, layer=1, embedding=_fake_vec(2))
+        l1_c = Insight(id="l1c", corpus_id="corp-1", text="c", strategy="bridge",
+                       score=0.6, layer=1, embedding=_fake_vec(3))
+        l2_ab = Insight(
+            id="l2ab", corpus_id="corp-1", text="bridges a and b",
+            strategy="meta", score=0.7, layer=2,
+            source_insight_ids=["l1a", "l1b"], embedding=_fake_vec(50),
+        )
+        for ins in (l1_a, l1_b, l1_c, l2_ab):
+            graph.upsert_insight(ins)
+
+        pairs = graph.existing_meta_bridge_pairs(["l1a", "l1b", "l1c"])
+        # Only (l1a, l1b) is bridged; (l1a, l1c) and (l1b, l1c) are not.
+        assert pairs == {tuple(sorted(["l1a", "l1b"]))}
+
+    def test_existing_meta_bridge_pairs_empty_input(self, graph):
+        assert graph.existing_meta_bridge_pairs([]) == set()
+
     def test_l2_insight_links_to_source_insight(self, graph):
         graph.upsert_corpus(_make_corpus())
         l1 = Insight(

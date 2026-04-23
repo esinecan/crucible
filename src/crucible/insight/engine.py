@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import random
 import uuid
@@ -10,6 +11,8 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 from ..config import Config
+
+logger = logging.getLogger(__name__)
 from ..embeddings import embed_batch, embed_text
 from ..graph.client import CrucibleGraph
 from ..llm_client import LLMClient, parse_json_lenient
@@ -661,23 +664,78 @@ class InsightEngine:
         if len(samples) < 2:
             return []
 
+        # Cross-cycle dedup: any (a_id, b_id) pair already bridged by an L2
+        # in the graph is skipped at candidate generation. Without this,
+        # re-running meta on the same L1 pool re-bridges the same near-top-
+        # similarity pairs (cocrucible run produced 4 L2s of which 2 were
+        # the same gap×hub pair with slightly different LLM-synthesized text).
+        sample_ids = [s["id"] for s in samples]
+        existing_pairs = self.graph.existing_meta_bridge_pairs(sample_ids)
+
         candidates: list[tuple[float, dict, dict]] = []
+        skipped_existing = 0
         for i, a in enumerate(samples):
             for b in samples[i + 1:]:
                 if a["strategy"] == b["strategy"]:
+                    continue
+                pair_id = tuple(sorted([a["id"], b["id"]]))
+                if pair_id in existing_pairs:
+                    skipped_existing += 1
                     continue
                 sim = _cosine(a["embedding"], b["embedding"])
                 if sim >= 0.65:
                     candidates.append((sim, a, b))
 
+        if skipped_existing:
+            logger.info(
+                "meta: skipped %d candidate pair(s) already bridged in graph",
+                skipped_existing,
+            )
+
         seen_pairs: set[tuple[str, str]] = set()
         insights: list[Insight] = []
+        sorted_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)
 
-        for sim, a, b in sorted(candidates, key=lambda x: x[0], reverse=True):
+        # Anti-cluster: if the last 2 accepted insights were the same
+        # (a_strategy, b_strategy) pair, push further candidates of that
+        # same pair to the back of the queue so other strategy combinations
+        # get airtime first. Cocrucible run produced 4 L2s all sharing the
+        # gap×hub pair because top-similarity candidates clustered there;
+        # this lets the cycle reach down to lower-similarity but different
+        # cross-strategy bridges instead.
+        deferred: list[tuple[float, dict, dict]] = []
+        recent_strategy_pairs: list[tuple[str, str]] = []
+
+        def _next_candidate() -> tuple[float, dict, dict] | None:
+            while sorted_candidates:
+                sim_, a_, b_ = sorted_candidates[0]
+                strat_pair_ = tuple(sorted([a_["strategy"], b_["strategy"]]))
+                if (
+                    len(recent_strategy_pairs) >= 2
+                    and recent_strategy_pairs[-1] == strat_pair_
+                    and recent_strategy_pairs[-2] == strat_pair_
+                ):
+                    deferred.append(sorted_candidates.pop(0))
+                    continue
+                return sorted_candidates.pop(0)
+            # Main pool exhausted; fall back to deferred (preserves their
+            # similarity order so we don't lose information).
+            if deferred:
+                return deferred.pop(0)
+            return None
+
+        while True:
+            picked = _next_candidate()
+            if picked is None:
+                break
+            sim, a, b = picked
             pair = tuple(sorted([a["id"], b["id"]]))
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
+            recent_strategy_pairs.append(
+                tuple(sorted([a["strategy"], b["strategy"]]))
+            )
 
             strategy_bonus = 1.0 if a["strategy"] != b["strategy"] else 0.7
             avg_original = (a["original_score"] + b["original_score"]) / 2

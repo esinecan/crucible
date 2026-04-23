@@ -354,6 +354,33 @@ class CrucibleGraph:
                 rows.append(d)
             return rows
 
+    def existing_meta_bridge_pairs(
+        self, insight_ids: list[str]
+    ) -> set[tuple[str, str]]:
+        """Return the set of (a_id, b_id) sorted tuples that already have an L2
+        meta insight bridging both source ids. Used by `_meta_cycle` so that
+        re-running meta on the same L1 pool doesn't burn LLM cycles
+        synthesizing a bridge that already exists in the graph.
+        """
+        if not insight_ids:
+            return set()
+        with self._driver.session() as s:
+            rows = list(s.run(
+                "MATCH (l2:Insight {layer: 2, strategy: 'meta'})"
+                "-[:DERIVED_FROM]->(src:Insight) "
+                "WHERE src.id IN $ids "
+                "WITH l2, collect(DISTINCT src.id) AS srcs "
+                "WHERE size(srcs) = 2 "
+                "RETURN srcs",
+                ids=insight_ids,
+            ))
+        pairs: set[tuple[str, str]] = set()
+        for r in rows:
+            srcs = r["srcs"]
+            if len(srcs) == 2:
+                pairs.add(tuple(sorted(srcs)))
+        return pairs
+
     def get_unembedded_insights(self, batch_size: int = 100) -> list[dict]:
         with self._driver.session() as s:
             return [
