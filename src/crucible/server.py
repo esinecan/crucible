@@ -171,6 +171,7 @@ def rate_insight(insight_id: str, score: float) -> str:
     """
     from .insight.engine import InsightEngine
 
+    score = max(0.0, min(1.0, float(score)))
     engine = InsightEngine(config, graph, use_evaluator=False)
     arm = engine.apply_human_feedback(insight_id, score)
     if arm:

@@ -57,7 +57,7 @@ When answer mode uses insights as evidence and the answer scores well, those ins
 ### Prerequisites
 - Docker (for Neo4j)
 - Python 3.12+ with venv at `~/dev5/crucible/.venv/`
-- Ollama with `nomic-embed-text` model pulled
+- `GEMINI_API_KEY` env var (for embeddings)
 - `DEEPSEEK_API_KEY` env var (for evaluation and synthesis)
 
 ### Active Instances
@@ -101,9 +101,9 @@ export CRUCIBLE_DOMAIN="Turkish political commentary knowledge base."
 
 ```
 src/crucible/
-├── config.py           — All settings: neo4j, ollama, deepseek, MCTS params, domain
+├── config.py           — All settings: neo4j, deepseek, MCTS params, domain
 ├── models.py           — Corpus, Document, Chunk, Insight, ReasoningNode
-├── embeddings.py       — Ollama embedding client (batch + single)
+├── embeddings.py       — Gemini embedding client (sync batch + Batch API)
 ├── server.py           — MCP server: 7 tools (search, fulltext, cypher, stats,
 │                         get_insights, answer, reasoning_trees)
 ├── __main__.py         — CLI: ingest, explore, answer, stats, bandit, serve

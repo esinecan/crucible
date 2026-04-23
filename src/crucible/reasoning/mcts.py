@@ -33,13 +33,45 @@ class ActionBandit:
     Unlike the insight bandit (Thompson Sampling / Beta-Bernoulli),
     this uses UCB1 because the action space is small (4 actions) and
     we want deterministic selection, not stochastic.
+
+    Persistence: pass persistence_log to replay per-action observations from
+    a reward log on init and append future updates. Mirrors the Thompson
+    bandit's load_from_log pattern so learned policy carries across CLI
+    invocations.
     """
 
-    def __init__(self, actions: list[Action], c: float = 1.41):
+    def __init__(
+        self,
+        actions: list[Action],
+        c: float = 1.41,
+        persistence_log: str | Path | None = None,
+    ):
         self._actions = {a.name: a for a in actions}
         self._visits: dict[str, int] = {a.name: 0 for a in actions}
         self._total: dict[str, float] = {a.name: 0.0 for a in actions}
         self._c = c
+        self._persistence_log = Path(persistence_log) if persistence_log else None
+        if self._persistence_log:
+            self._load_from_log(self._persistence_log)
+
+    def _load_from_log(self, path: Path) -> None:
+        """Replay answer_action entries to reconstruct visit/score state."""
+        if not path.exists():
+            return
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("mode") != "answer_action":
+                continue
+            action = entry.get("action", "")
+            score = entry.get("score")
+            if action in self._visits and isinstance(score, (int, float)):
+                self._visits[action] += 1
+                self._total[action] += float(score)
 
     def select(self, node: ReasoningNode) -> Action:
         """Pick the best action for this node via UCB1.
@@ -74,10 +106,24 @@ class ActionBandit:
         return self._actions[best]
 
     def update(self, action_name: str, score: float) -> None:
-        """Update action stats after observing a score."""
-        if action_name in self._visits:
-            self._visits[action_name] += 1
-            self._total[action_name] += score
+        """Update action stats after observing a score. Appends to the
+        persistence log if configured.
+        """
+        if action_name not in self._visits:
+            return
+        self._visits[action_name] += 1
+        self._total[action_name] += score
+        if self._persistence_log is not None:
+            try:
+                with open(self._persistence_log, "a") as f:
+                    f.write(json.dumps({
+                        "mode": "answer_action",
+                        "action": action_name,
+                        "score": score,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }) + "\n")
+            except Exception:
+                pass  # persistence is best-effort; don't break the bandit
 
     def stats(self) -> dict[str, dict]:
         return {
@@ -102,8 +148,12 @@ class MCTSEngine:
         self.graph = graph
         self.referee = referee or LLMReferee(config)
         self.actions = actions or list(ACTION_REGISTRY.values())
-        self.action_bandit = ActionBandit(self.actions, c=config.mcts_uct_c)
         self.reward_log = Path(reward_log) if reward_log else Path("answer_rewards.jsonl")
+        self.action_bandit = ActionBandit(
+            self.actions,
+            c=config.mcts_uct_c,
+            persistence_log=self.reward_log,
+        )
         self._nodes: dict[str, ReasoningNode] = {}
 
     # ── UCT Selection ──────────────────────────────────────
@@ -164,7 +214,8 @@ class MCTSEngine:
         for eid in node.evidence_ids[-5:]:
             try:
                 results = self.graph.cypher_read(
-                    f"MATCH (n) WHERE n.id = '{eid}' RETURN n.text AS text LIMIT 1"
+                    "MATCH (n) WHERE n.id = $eid RETURN n.text AS text LIMIT 1",
+                    eid=eid,
                 )
                 if results and results[0].get("text"):
                     evidence_texts.append(results[0]["text"][:300])

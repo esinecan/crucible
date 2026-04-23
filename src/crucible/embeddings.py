@@ -1,10 +1,8 @@
 """Embedding client for Crucible.
 
-Supports two backends:
-  - Gemini (default): gemini-embedding-001, 768-dim MRL, requires GEMINI_API_KEY
-  - Ollama (fallback): local nomic-embed-text, 768-dim, no API key needed
-
-Set CRUCIBLE_EMBED_BACKEND=ollama to use Ollama. Default is gemini.
+Uses Gemini (gemini-embedding-001 by default, 768-dim MRL) via the
+google-genai SDK. Requires GEMINI_API_KEY. A Batch API path is available
+for bulk re-embedding (50% cheaper, async).
 """
 from __future__ import annotations
 
@@ -12,13 +10,9 @@ import logging
 import os
 import time
 
-import httpx
-
 from .config import Config
 
 logger = logging.getLogger(__name__)
-
-EMBED_BACKEND = os.environ.get("CRUCIBLE_EMBED_BACKEND", "gemini")
 
 
 # ── Gemini backend ────────────────────────────────────────
@@ -33,7 +27,7 @@ def _gemini_embed(texts: list[str], config: Config) -> list[list[float]]:
     def _client():
         api_key = os.environ.get("GEMINI_API_KEY", "")
         if not api_key:
-            raise RuntimeError("GEMINI_API_KEY not set. Set it or use CRUCIBLE_EMBED_BACKEND=ollama")
+            raise RuntimeError("GEMINI_API_KEY not set")
         return genai.Client(api_key=api_key)
 
     client = _client()
@@ -65,35 +59,6 @@ def _gemini_embed(texts: list[str], config: Config) -> list[list[float]]:
                 raise
 
 
-# ── Ollama backend ────────────────────────────────────────
-
-def _ollama_embed(texts: list[str], config: Config) -> list[list[float]]:
-    cleaned = [t if t and t.strip() else " " for t in texts]
-    try:
-        resp = httpx.post(
-            f"{config.ollama_url}/api/embed",
-            json={"model": config.embed_model, "input": cleaned},
-            timeout=120.0,
-        )
-        resp.raise_for_status()
-        return resp.json()["embeddings"]
-    except Exception:
-        logger.warning("Ollama batch failed, falling back to one-by-one")
-        all_embs: list[list[float]] = []
-        for t in cleaned:
-            try:
-                r = httpx.post(
-                    f"{config.ollama_url}/api/embed",
-                    json={"model": config.embed_model, "input": [t]},
-                    timeout=30.0,
-                )
-                r.raise_for_status()
-                all_embs.extend(r.json()["embeddings"])
-            except Exception:
-                all_embs.append([0.0] * config.embed_dim)
-        return all_embs
-
-
 # ── Public API ────────────────────────────────────────────
 
 def embed_batch(
@@ -101,28 +66,17 @@ def embed_batch(
 ) -> list[list[float]]:
     """Embed multiple texts. Returns list of 768-dim vectors.
 
-    Gemini: batches of batch_size with 1s delay for rate limiting.
-    Ollama: batches of 200 (local, no rate limits).
+    Batches of batch_size with 1s delay between batches for rate limiting.
     """
     if not texts:
         return []
 
-    backend = EMBED_BACKEND
-
-    if backend == "gemini":
-        all_embeddings: list[list[float]] = []
-        for i in range(0, len(texts), batch_size):
-            chunk = texts[i: i + batch_size]
-            all_embeddings.extend(_gemini_embed(chunk, config))
-            if i + batch_size < len(texts):
-                time.sleep(1)
-        return all_embeddings
-
-    # Ollama: larger batches, no delay
-    all_embeddings = []
-    for i in range(0, len(texts), 200):
-        chunk = texts[i: i + 200]
-        all_embeddings.extend(_ollama_embed(chunk, config))
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        chunk = texts[i: i + batch_size]
+        all_embeddings.extend(_gemini_embed(chunk, config))
+        if i + batch_size < len(texts):
+            time.sleep(1)
     return all_embeddings
 
 

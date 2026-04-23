@@ -5,5 +5,17 @@ __pycache__/
 dist/
 build/
 insight_rewards.jsonl
+answer_rewards.jsonl
 .crucible_progress.json
 .nous_progress.json
+
+# pytest / coverage runtime
+.coverage
+.pytest_cache/
+
+# Exploration / runtime artifacts
+output/
+
+# IDE local-history extensions
+.history/
+.lh/

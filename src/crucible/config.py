@@ -14,12 +14,6 @@ class Config:
         default_factory=lambda: os.getenv("CRUCIBLE_NEO4J_PASSWORD", "nous-dev")
     )
 
-    ollama_url: str = field(
-        default_factory=lambda: os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    )
-    embed_model: str = field(
-        default_factory=lambda: os.getenv("CRUCIBLE_EMBED_MODEL", "nomic-embed-text")
-    )
     embed_dim: int = 768
 
     eval_model: str = field(

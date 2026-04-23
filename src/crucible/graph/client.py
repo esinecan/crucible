@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from neo4j import GraphDatabase
+from neo4j.exceptions import ClientError
 
 from ..config import Config
 from ..extraction import sanitize_rel_type
@@ -39,8 +40,16 @@ class CrucibleGraph:
     # ── Document ────────────────────────────────────────────
 
     def upsert_document(self, doc: Document) -> None:
-        with self._driver.session() as s:
-            s.run(
+        def _tx(tx):
+            found = tx.run(
+                "MATCH (c:Corpus {id: $cid}) RETURN c.id AS cid",
+                cid=doc.corpus_id,
+            ).single()
+            if found is None:
+                raise ValueError(
+                    f"Corpus {doc.corpus_id!r} not found; call upsert_corpus first"
+                )
+            tx.run(
                 "MERGE (d:Document {id: $id}) "
                 "SET d.corpus_id=$cid, d.path=$path, d.title=$title, "
                 "d.source_type=$st, d.content_hash=$hash, "
@@ -57,6 +66,9 @@ class CrucibleGraph:
                 meta=json.dumps(doc.metadata),
                 ts=doc.ingested_at,
             )
+
+        with self._driver.session() as s:
+            s.execute_write(_tx)
 
     # ── Chunks ──────────────────────────────────────────────
 
@@ -165,20 +177,32 @@ class CrucibleGraph:
         with self._driver.session() as s:
             return [dict(r) for r in s.run(q, emb=embedding, k=limit, cid=corpus_id)]
 
-    def cypher_read(self, query: str) -> list[dict]:
-        blocked = {"CREATE", "DELETE", "SET", "REMOVE", "MERGE", "DROP", "DETACH"}
-        tokens = set(query.upper().split())
-        for kw in blocked:
-            if kw in tokens:
-                raise ValueError(f"Write keyword '{kw}' blocked in read-only cypher")
-        with self._driver.session() as s:
-            return [dict(r) for r in s.run(query)]
+    def cypher_read(self, query: str, **params) -> list[dict]:
+        """Execute a read-only Cypher query.
+
+        Uses a managed read transaction so Neo4j itself refuses writes — no
+        keyword blocklist to bypass. Parameters are passed as kwargs; prefer
+        them over string interpolation to avoid Cypher injection.
+        """
+        def _read(tx):
+            return [dict(r) for r in tx.run(query, **params)]
+
+        try:
+            with self._driver.session() as s:
+                return s.execute_read(_read)
+        except ClientError as e:
+            # Translate the driver's write-in-read-transaction rejection into
+            # the ValueError callers already expect.
+            msg = str(e).lower()
+            if "write" in msg or "read" in msg or "access" in msg:
+                raise ValueError(f"Write operation blocked in read-only cypher: {e}") from e
+            raise
 
     # ── Insight ─────────────────────────────────────────────
 
     def upsert_insight(self, insight: Insight) -> None:
-        with self._driver.session() as s:
-            s.run(
+        def _tx(tx):
+            tx.run(
                 "MERGE (i:Insight {id: $id}) "
                 "SET i.corpus_id=$cid, i.text=$text, i.strategy=$strat, "
                 "i.score=$score, i.novelty=$nov, i.relevance=$rel, "
@@ -196,22 +220,27 @@ class CrucibleGraph:
                 ctx=json.dumps(insight.context),
                 ts=insight.created_at,
             )
-            # L1: link to source chunks
-            for chunk_id in insight.source_chunk_ids:
-                s.run(
-                    "MATCH (i:Insight {id: $iid}), (ch:Chunk {id: $cid}) "
+            if insight.source_chunk_ids:
+                tx.run(
+                    "MATCH (i:Insight {id: $iid}) "
+                    "UNWIND $cids AS cid "
+                    "MATCH (ch:Chunk {id: cid}) "
                     "MERGE (i)-[:DERIVED_FROM]->(ch)",
                     iid=insight.id,
-                    cid=chunk_id,
+                    cids=insight.source_chunk_ids,
                 )
-            # L2: link to source insights
-            for src_id in insight.source_insight_ids:
-                s.run(
-                    "MATCH (i:Insight {id: $iid}), (src:Insight {id: $sid}) "
+            if insight.source_insight_ids:
+                tx.run(
+                    "MATCH (i:Insight {id: $iid}) "
+                    "UNWIND $sids AS sid "
+                    "MATCH (src:Insight {id: sid}) "
                     "MERGE (i)-[:DERIVED_FROM]->(src)",
                     iid=insight.id,
-                    sid=src_id,
+                    sids=insight.source_insight_ids,
                 )
+
+        with self._driver.session() as s:
+            s.execute_write(_tx)
 
     # ── Stats & Sampling ────────────────────────────────────
 
@@ -302,8 +331,8 @@ class CrucibleGraph:
     # ── Reasoning Tree ─────────────────────────────────────
 
     def upsert_reasoning_node(self, node: ReasoningNode) -> None:
-        with self._driver.session() as s:
-            s.run(
+        def _tx(tx):
+            tx.run(
                 "MERGE (rn:ReasoningNode {id: $id}) "
                 "SET rn.tree_id=$tid, rn.query=$q, "
                 "rn.evidence_ids=$ev, rn.partial_answer=$ans, "
@@ -325,26 +354,36 @@ class CrucibleGraph:
                 cat=node.created_at,
             )
             if node.parent_id:
-                s.run(
+                tx.run(
                     "MATCH (child:ReasoningNode {id: $cid}), "
                     "(parent:ReasoningNode {id: $pid}) "
                     "MERGE (child)-[:CHILD_OF]->(parent)",
                     cid=node.id,
                     pid=node.parent_id,
                 )
-            # Link evidence (chunks and insights)
-            for eid in node.evidence_ids:
-                s.run(
+            if node.evidence_ids:
+                # Link evidence chunks + insights in two UNWIND passes.
+                # Non-matching ids are silently dropped by MATCH, same as
+                # the original FOREACH/OPTIONAL-MATCH behavior.
+                tx.run(
                     "MATCH (rn:ReasoningNode {id: $rid}) "
-                    "OPTIONAL MATCH (ch:Chunk {id: $eid}) "
-                    "OPTIONAL MATCH (i:Insight {id: $eid}) "
-                    "FOREACH (_ IN CASE WHEN ch IS NOT NULL THEN [1] ELSE [] END | "
-                    "  MERGE (rn)-[:USES_EVIDENCE]->(ch)) "
-                    "FOREACH (_ IN CASE WHEN i IS NOT NULL THEN [1] ELSE [] END | "
-                    "  MERGE (rn)-[:USES_EVIDENCE]->(i))",
+                    "UNWIND $eids AS eid "
+                    "MATCH (ch:Chunk {id: eid}) "
+                    "MERGE (rn)-[:USES_EVIDENCE]->(ch)",
                     rid=node.id,
-                    eid=eid,
+                    eids=node.evidence_ids,
                 )
+                tx.run(
+                    "MATCH (rn:ReasoningNode {id: $rid}) "
+                    "UNWIND $eids AS eid "
+                    "MATCH (i:Insight {id: eid}) "
+                    "MERGE (rn)-[:USES_EVIDENCE]->(i)",
+                    rid=node.id,
+                    eids=node.evidence_ids,
+                )
+
+        with self._driver.session() as s:
+            s.execute_write(_tx)
 
     def get_reasoning_tree(self, tree_id: str) -> list[dict]:
         with self._driver.session() as s:
@@ -369,18 +408,27 @@ class CrucibleGraph:
     # ── Entity Extraction ──────────────────────────────────
 
     def upsert_entity(self, entity: Entity) -> None:
-        with self._driver.session() as s:
-            s.run(
+        """Upsert an Entity, unioning source_chunks and aliases across calls.
+
+        source_chunks is the authoritative mention trace — the mention_count
+        readings in queries derive from size(source_chunks). description still
+        uses 'longer wins' as a stopgap; async synthesis is the planned fix.
+        """
+        def _tx(tx):
+            tx.run(
                 "MERGE (e:Entity {id: $id}) "
                 "ON CREATE SET e.corpus_id=$cid, e.name=$name, "
                 "  e.entity_type=$etype, e.description=$desc, "
                 "  e.aliases=$aliases, e.embedding=$emb, "
-                "  e.mention_count=1, e.properties=$props, e.created_at=$ts "
-                "ON MATCH SET e.mention_count = e.mention_count + 1, "
+                "  e.source_chunks=$chunks, e.properties=$props, "
+                "  e.created_at=$ts "
+                "ON MATCH SET "
+                "  e.source_chunks = e.source_chunks + "
+                "    [x IN $chunks WHERE NOT x IN e.source_chunks], "
+                "  e.aliases = e.aliases + "
+                "    [x IN $aliases WHERE NOT x IN e.aliases], "
                 "  e.description = CASE WHEN size(e.description) < size($desc) "
-                "    THEN $desc ELSE e.description END, "
-                "  e.aliases = CASE WHEN size(e.aliases) < size($aliases) "
-                "    THEN $aliases ELSE e.aliases END",
+                "    THEN $desc ELSE e.description END",
                 id=entity.id,
                 cid=entity.corpus_id,
                 name=entity.name,
@@ -388,35 +436,52 @@ class CrucibleGraph:
                 desc=entity.description,
                 aliases=entity.aliases,
                 emb=entity.embedding or None,
+                chunks=entity.source_chunks,
                 props=json.dumps(entity.properties),
                 ts=entity.created_at,
             )
 
-    def upsert_relation(self, relation: Relation) -> None:
-        """Create a typed relationship between entities via dynamic Cypher.
+        with self._driver.session() as s:
+            s.execute_write(_tx)
 
-        Safe because relation_type comes from our ontology and is sanitized
-        to [A-Z0-9_] only before interpolation.
+    def upsert_relation(self, relation: Relation) -> None:
+        """Create or augment a typed relationship between entities.
+
+        Dynamic Cypher is safe because relation_type passes through
+        sanitize_rel_type which pins it to ^[A-Z][A-Z0-9_]*$. The relation id
+        is hash(src, rel_type, tgt), so re-extracting the same claim from a
+        new chunk augments source_chunks rather than creating a new edge.
         """
         rel_type = sanitize_rel_type(relation.relation_type)
         query = (
             f"MATCH (src:Entity {{id: $src_id}}), (tgt:Entity {{id: $tgt_id}}) "
             f"MERGE (src)-[r:{rel_type} {{id: $rid}}]->(tgt) "
-            f"SET r.evidence=$ev, r.confidence=$conf, "
-            f"r.source_chunk_id=$cid, r.properties=$props, r.created_at=$ts"
+            f"ON CREATE SET "
+            f"  r.evidence=$ev, r.confidence=$conf, "
+            f"  r.source_chunks=$chunks, r.properties=$props, "
+            f"  r.created_at=$ts "
+            f"ON MATCH SET "
+            f"  r.source_chunks = r.source_chunks + "
+            f"    [x IN $chunks WHERE NOT x IN r.source_chunks], "
+            f"  r.confidence = CASE WHEN r.confidence < $conf "
+            f"    THEN $conf ELSE r.confidence END"
         )
-        with self._driver.session() as s:
-            s.run(
+
+        def _tx(tx):
+            tx.run(
                 query,
                 src_id=relation.source_entity_id,
                 tgt_id=relation.target_entity_id,
                 rid=relation.id,
                 ev=relation.evidence,
                 conf=relation.confidence,
-                cid=relation.source_chunk_id,
+                chunks=relation.source_chunks,
                 props=json.dumps(relation.properties),
                 ts=relation.created_at,
             )
+
+        with self._driver.session() as s:
+            s.execute_write(_tx)
 
     def link_entity_to_chunk(self, entity_id: str, chunk_id: str) -> None:
         with self._driver.session() as s:
@@ -437,7 +502,7 @@ class CrucibleGraph:
                     "RETURN node.id AS id, node.name AS name, "
                     "node.entity_type AS entity_type, "
                     "node.description AS description, "
-                    "node.mention_count AS mention_count, score "
+                    "size(node.source_chunks) AS mention_count, score "
                     "ORDER BY score DESC LIMIT $lim",
                     q=query,
                     lim=limit,
@@ -488,20 +553,40 @@ class CrucibleGraph:
                 )
             ]
 
-    def get_unextracted_chunks(
-        self, corpus_id: str, batch_size: int = 50
-    ) -> list[dict]:
+    def get_unextracted_docs(self, corpus_id: str) -> list[dict]:
+        """List documents that still have at least one un-extracted chunk.
+
+        Order is by document path for deterministic test behavior.
+        """
         with self._driver.session() as s:
             return [
                 dict(r)
                 for r in s.run(
-                    "MATCH (ch:Chunk)-[:PART_OF]->(d:Document {corpus_id: $cid}) "
+                    "MATCH (d:Document {corpus_id: $cid})<-[:PART_OF]-(ch:Chunk) "
+                    "WHERE NOT exists((ch)-[:EXTRACTION_DONE]->(:Corpus {id: $cid})) "
+                    "WITH d, count(ch) AS pending "
+                    "WHERE pending > 0 "
+                    "RETURN d.id AS doc_id, d.path AS path, pending "
+                    "ORDER BY d.path",
+                    cid=corpus_id,
+                )
+            ]
+
+    def get_unextracted_chunks_for_doc(
+        self, doc_id: str, corpus_id: str
+    ) -> list[dict]:
+        """All unextracted chunks for one document, ordered by position."""
+        with self._driver.session() as s:
+            return [
+                dict(r)
+                for r in s.run(
+                    "MATCH (ch:Chunk)-[:PART_OF]->(d:Document {id: $did, corpus_id: $cid}) "
                     "WHERE NOT exists((ch)-[:EXTRACTION_DONE]->(:Corpus {id: $cid})) "
                     "RETURN ch.id AS id, ch.text AS text, "
                     "ch.heading AS heading, d.path AS doc_path "
-                    "LIMIT $n",
+                    "ORDER BY ch.position",
+                    did=doc_id,
                     cid=corpus_id,
-                    n=batch_size,
                 )
             ]
 

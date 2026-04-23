@@ -7,7 +7,7 @@ Ingest any corpus. Discover patterns. Answer questions. No domain-specific confi
 ## Quick Start
 
 ```bash
-# Prerequisites: Docker, Python 3.12+, Ollama with nomic-embed-text
+# Prerequisites: Docker, Python 3.12+, GEMINI_API_KEY (and DEEPSEEK_API_KEY for eval/synthesis)
 
 # 1. Start Neo4j
 cd ~/dev5/crucible
@@ -101,7 +101,7 @@ ReasoningNode (CHILD_OF parent, USES_EVIDENCE → chunk/insight)
 **Node types:**
 - `Corpus` — a named collection of documents
 - `Document` — a file (markdown, JSON, text, code)
-- `Chunk` — a section of a document with a 768-dim embedding (nomic-embed-text)
+- `Chunk` — a section of a document with a 768-dim embedding (gemini-embedding-001, MRL-truncated)
 - `Insight` — a discovered pattern (L1 from chunks, L2 from L1 insights)
 - `ReasoningNode` — a node in an MCTS reasoning tree
 
@@ -151,12 +151,12 @@ All config via environment variables (yaml config file planned):
 | `CRUCIBLE_NEO4J_URI` | `bolt://localhost:7689` | Neo4j Bolt endpoint |
 | `CRUCIBLE_NEO4J_USER` | `neo4j` | Neo4j username |
 | `CRUCIBLE_NEO4J_PASSWORD` | `nous-dev` | Neo4j password |
-| `CRUCIBLE_EMBED_MODEL` | `nomic-embed-text` | Ollama embedding model |
+| `CRUCIBLE_GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Gemini embedding model |
 | `CRUCIBLE_EVAL_MODEL` | `deepseek-chat` | LLM for evaluation/synthesis |
 | `CRUCIBLE_DOMAIN` | (empty) | Domain context injected into all LLM prompts |
+| `GEMINI_API_KEY` | (required) | Gemini API key for embeddings |
 | `DEEPSEEK_API_KEY` | (required for eval) | DeepSeek API key |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API endpoint |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama API endpoint |
 
 ## Key Concepts
 
@@ -209,7 +209,7 @@ src/crucible/
 ├── __main__.py              # CLI entry point
 ├── config.py                # Configuration (env vars, MCTS params)
 ├── models.py                # Data models (Corpus, Document, Chunk, Insight, ReasoningNode)
-├── embeddings.py            # Ollama embedding client
+├── embeddings.py            # Gemini embedding client (sync + Batch API)
 ├── server.py                # MCP server
 ├── graph/
 │   ├── client.py            # Neo4j CRUD, search, tree persistence

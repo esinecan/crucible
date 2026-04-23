@@ -87,7 +87,13 @@ class ReasoningNode:
 
 @dataclass
 class Entity:
-    """A named entity extracted from corpus text via ontology-guided extraction."""
+    """A named entity extracted from corpus text via ontology-guided extraction.
+
+    source_chunks carries provenance: every chunk whose extraction contributed
+    to this entity. mention_count is derived from len(source_chunks) rather
+    than stored, eliminating the overlap-inflation bug in the old per-call
+    increment scheme.
+    """
 
     id: str  # deterministic: hash(corpus_id, entity_type, lower(name))
     corpus_id: str
@@ -96,21 +102,26 @@ class Entity:
     description: str = ""
     aliases: list[str] = field(default_factory=list)
     embedding: list[float] = field(default_factory=list)
-    mention_count: int = 1
+    source_chunks: list[str] = field(default_factory=list)
     properties: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)
 
 
 @dataclass
 class Relation:
-    """A typed relationship between two entities, extracted from chunk text."""
+    """A typed relationship between two entities, aggregated across chunks.
 
-    id: str  # deterministic: hash(src_id, rel_type, tgt_id, chunk_id)
+    A relation is a claim (src --rel_type--> tgt), not a per-chunk observation.
+    Multiple chunks asserting the same claim collapse to a single Relation
+    whose source_chunks list preserves provenance.
+    """
+
+    id: str  # deterministic: hash(src_id, rel_type, tgt_id)
     source_entity_id: str
     target_entity_id: str
     relation_type: str  # UPPER_SNAKE_CASE from ontology
-    evidence: str = ""  # quote from source text
+    evidence: str = ""  # representative quote(s) from source text
     confidence: float = 0.0
-    source_chunk_id: str = ""
+    source_chunks: list[str] = field(default_factory=list)
     properties: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)

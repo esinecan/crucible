@@ -27,6 +27,15 @@ STRATEGIES = ["bridge", "outlier", "hub", "meta", "contradiction", "gap"]
 DEFAULT_NOISE_PATTERNS = [
     "docs/diffs/*",
     "*.json",
+    # Dev-environment clutter that slips into corpora when a repo is ingested
+    ".history/*",
+    ".lh/*",
+    ".venv/*",
+    "node_modules/*",
+    "__pycache__/*",
+    "dist/*",
+    "build/*",
+    ".git/*",
 ]
 
 MIN_CHUNK_LENGTH = 80
@@ -240,7 +249,8 @@ class InsightEngine:
         # 1. Source chunk texts
         for cid in insight.source_chunk_ids[:5]:
             results = self.graph.cypher_read(
-                f"MATCH (c:Chunk {{id: '{cid}'}}) RETURN c.text AS text LIMIT 1"
+                "MATCH (c:Chunk {id: $cid}) RETURN c.text AS text LIMIT 1",
+                cid=cid,
             )
             if results and results[0].get("text"):
                 source_chunks.append(results[0]["text"][:500])
@@ -370,7 +380,7 @@ class InsightEngine:
                     "ORDER BY r LIMIT 50 "
                     "RETURN e.name AS entity, c1.id AS c1_id, c1.text AS c1_text, "
                     "d1.path AS d1_path, c2.id AS c2_id, c2.text AS c2_text, "
-                    "d2.path AS d2_path, e.mention_count AS mc"
+                    "d2.path AS d2_path, size(e.source_chunks) AS mc"
                 )
             ]
 
@@ -1080,34 +1090,45 @@ class InsightEngine:
         if answer_score < 0.5:
             return 0  # only reward from good answers
 
-        bonus = answer_score * 0.3  # scaled bonus, not full score
-        rewarded = 0
+        if not evidence_ids:
+            return 0
 
-        for eid in evidence_ids:
-            # Check if this evidence ID is an insight
-            results = self.graph.cypher_read(
-                f"MATCH (i:Insight {{id: '{eid}'}}) RETURN i.strategy AS strategy"
-            )
-            if results:
-                strategy = results[0]["strategy"]
-                arm = strategy.replace("_discovery", "").replace("_detection", "")
-                if arm in self.bandit.alpha:
-                    self.bandit.update(arm, bonus)
-                    self._log_reward(
-                        mode="answer_feedback",
-                        strategy=arm,
-                        score=bonus,
-                        insight_id=eid,
-                        answer_score=answer_score,
-                    )
-                    rewarded += 1
+        bonus = answer_score * 0.3  # scaled bonus, not full score
+
+        # One round-trip: resolve all evidence ids to any matching insights.
+        results = self.graph.cypher_read(
+            "UNWIND $eids AS eid "
+            "MATCH (i:Insight {id: eid}) "
+            "RETURN i.id AS id, i.strategy AS strategy",
+            eids=evidence_ids,
+        )
+
+        rewarded = 0
+        for row in results:
+            strategy = row["strategy"]
+            arm = strategy.replace("_discovery", "").replace("_detection", "")
+            if arm in self.bandit.alpha:
+                self.bandit.update(arm, bonus)
+                self._log_reward(
+                    mode="answer_feedback",
+                    strategy=arm,
+                    score=bonus,
+                    insight_id=row["id"],
+                    answer_score=answer_score,
+                )
+                rewarded += 1
 
         return rewarded
 
     def apply_human_feedback(self, insight_id: str, score: float) -> str | None:
-        """Apply human feedback score to an insight. Weighted 3x in bandit."""
+        """Apply human feedback score to an insight. Weighted 3x in bandit.
+
+        Score is clamped to [0.0, 1.0] — it feeds a Bernoulli bandit update.
+        """
+        score = max(0.0, min(1.0, float(score)))
         results = self.graph.cypher_read(
-            f"MATCH (i:Insight {{id: '{insight_id}'}}) RETURN i.strategy AS strategy"
+            "MATCH (i:Insight {id: $iid}) RETURN i.strategy AS strategy",
+            iid=insight_id,
         )
         if not results:
             return None

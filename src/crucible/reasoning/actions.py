@@ -31,11 +31,14 @@ class Action(ABC):
 class SearchAction(Action):
     """Hybrid vector + fulltext + insight + entity search for evidence.
 
-    Four search channels, deduplicated and ranked:
+    Five search channels, deduplicated and ranked:
     1. Vector search on chunk embeddings (semantic similarity)
     2. Fulltext search on chunk text (keyword matching)
     3. Vector search on insight embeddings (discovered patterns)
     4. Entity-based retrieval (find entities in query, get their chunks)
+    5. Query expansion (first search only): LLM decomposes the question into
+       conceptual facets, each seeding a separate vector search to reach
+       distant semantic neighborhoods the main query would miss.
     """
 
     name = "search"
@@ -85,10 +88,25 @@ class SearchAction(Action):
         except Exception:
             pass  # no entities or index not ready
 
+        # Channel 5: query expansion (first search only)
+        facet_queries: list[str] = []
+        if not parent.evidence_ids:
+            facet_queries = self._expand_query(parent.query, config)
+            for fq in facet_queries:
+                fq_embedding = embed_text(fq, config)
+                for r in graph.vector_search(fq_embedding, limit=5):
+                    if r["id"] not in seen:
+                        rid = r["id"]
+                        if rid in scored:
+                            if r["score"] > scored[rid][0]:
+                                scored[rid] = (r["score"], r)
+                        else:
+                            scored[rid] = (r["score"], r)
+
         if not scored:
             return None
 
-        ranked = sorted(scored.values(), key=lambda x: x[0], reverse=True)[:10]
+        ranked = sorted(scored.values(), key=lambda x: x[0], reverse=True)[:15]
         new_evidence = [r["id"] for _, r in ranked]
 
         return ReasoningNode(
@@ -103,10 +121,53 @@ class SearchAction(Action):
             context={
                 "new_evidence_count": len(new_evidence),
                 "search_text": search_text[:100],
+                "facet_queries": facet_queries,
                 "insight_evidence": sum(1 for _, r in ranked if "strategy" in r),
                 "entity_evidence": sum(1 for _, r in ranked if "doc_title" in r and r.get("doc_title")),
             },
         )
+
+    def _expand_query(self, query: str, config: Config) -> list[str]:
+        """Generate alternative facet queries to reach distant semantic neighborhoods."""
+        api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        model = os.getenv("CRUCIBLE_EVAL_MODEL", "deepseek-chat")
+        try:
+            resp = httpx.post(
+                f"{base_url}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": config.domain_preamble + (
+                                "Generate 4 alternative search queries that explore DIFFERENT "
+                                "conceptual facets of the user's question. Each query should "
+                                "target a different angle that a direct semantic search would "
+                                "miss: adjacent frameworks, counter-arguments, primary source "
+                                "claims, structural analogies, or implicit assumptions.\n\n"
+                                "Return ONLY a JSON array of 4 strings, nothing else."
+                            ),
+                        },
+                        {"role": "user", "content": query},
+                    ],
+                    "temperature": 0.5,
+                    "max_tokens": 300,
+                },
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            import json as _json
+            import re as _re
+            text = resp.json()["choices"][0]["message"]["content"]
+            match = _re.search(r"\[.*\]", text, _re.DOTALL)
+            if match:
+                queries = _json.loads(match.group())
+                return [q for q in queries if isinstance(q, str)][:4]
+        except Exception:
+            pass
+        return []
 
 
 class FollowRefAction(Action):
@@ -133,13 +194,15 @@ class FollowRefAction(Action):
         for eid in recent:
             # Follow NEXT edges (sequential context)
             neighbors = graph.cypher_read(
-                f"MATCH (n {{id: '{eid}'}})-[:NEXT]->(next:Chunk) "
-                f"RETURN next.id AS id LIMIT 2"
+                "MATCH (n {id: $eid})-[:NEXT]->(next:Chunk) "
+                "RETURN next.id AS id LIMIT 2",
+                eid=eid,
             )
             # Follow DERIVED_FROM (insight → source chunks)
             neighbors += graph.cypher_read(
-                f"MATCH (n {{id: '{eid}'}})-[:DERIVED_FROM]->(src) "
-                f"RETURN src.id AS id LIMIT 3"
+                "MATCH (n {id: $eid})-[:DERIVED_FROM]->(src) "
+                "RETURN src.id AS id LIMIT 3",
+                eid=eid,
             )
             for r in neighbors:
                 if r["id"] and r["id"] not in seen:
@@ -264,8 +327,9 @@ class SynthesizeAction(Action):
         evidence_texts = []
         for eid in parent.evidence_ids[-10:]:  # last 10 evidence items
             results = graph.cypher_read(
-                f"MATCH (n) WHERE n.id = '{eid}' "
-                f"RETURN n.text AS text, labels(n) AS labels LIMIT 1"
+                "MATCH (n) WHERE n.id = $eid "
+                "RETURN n.text AS text, labels(n) AS labels LIMIT 1",
+                eid=eid,
             )
             if results and results[0].get("text"):
                 text = results[0]["text"][:500]
@@ -315,16 +379,28 @@ class SynthesizeAction(Action):
                         {
                             "role": "system",
                             "content": config.domain_preamble + (
-                                "You are a knowledge analyst. Synthesize a grounded answer "
-                                "from the evidence provided. Cite specific evidence. "
-                                "If refining a prior answer, address the challenge directly. "
-                                "Be specific and concise."
+                                "You are a knowledge analyst with expertise in conceptual "
+                                "transfer — extracting generalizable principles from specific "
+                                "contexts and applying them to novel questions.\n\n"
+                                "Your process:\n"
+                                "1. EXTRACT: For each evidence chunk, identify any generalizable "
+                                "principle, analytical framework, or diagnostic lens it "
+                                "establishes. State each principle in domain-independent terms.\n"
+                                "2. APPLY: Map each extracted principle to the query. Show "
+                                "specifically how the principle transfers — what does it explain, "
+                                "challenge, or reframe about the question?\n"
+                                "3. SYNTHESIZE: Build your answer from the applied principles, "
+                                "citing the evidence that establishes each one.\n\n"
+                                "If refining a prior answer, focus on principles the prior "
+                                "answer missed or misapplied. Address any challenge by finding "
+                                "principles in the evidence that counter it.\n\n"
+                                "Be specific. Name the principles. Show the transfer logic."
                             ),
                         },
                         {"role": "user", "content": user_msg},
                     ],
                     "temperature": 0.3,
-                    "max_tokens": 800,
+                    "max_tokens": 1000,
                 },
                 timeout=30.0,
             )
